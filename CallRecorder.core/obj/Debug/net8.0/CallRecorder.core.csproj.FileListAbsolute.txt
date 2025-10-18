@@ -9,3 +9,4 @@ C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net
 C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\refint\CallRecorder.core.dll
 C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.pdb
 C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\ref\CallRecorder.core.dll
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.sourcelink.json

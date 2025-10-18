@@ -65,11 +65,12 @@ internal class CallRecordingService : BackgroundService
                 // Evaluate call state (Ringing -> Connected -> Ended)
                 var phase = _callState.Evaluate();
                 var now = DateTime.UtcNow;
+                var prevPhase = _lastPhase;
 
                 // Track phase changes
                 if (phase != _lastPhase)
                 {
-                    _logger.LogInformation("Call phase: {prev} -> {next}", _lastPhase, phase);
+                    _logger.LogInformation("Call phase: {prev} -> {next}", prevPhase, phase);
                     _lastPhase = phase;
                     _lastStateChangeUtc = now;
                 }
@@ -82,8 +83,8 @@ internal class CallRecordingService : BackgroundService
                 bool shouldStartRecording = false;
                 bool shouldStopRecording = false;
 
-                // Start when Connected (pre-roll is handled by engine prebuffer; file created on start)
-                if (phase == CallPhase.Connected && !_recManager.IsRecording)
+                // Start when transitioning into Connected (edge-triggered)
+                if (phase == CallPhase.Connected && prevPhase != CallPhase.Connected && !_recManager.IsRecording)
                 {
                     shouldStartRecording = true;
                     _callStartUtc = now;
@@ -105,7 +106,7 @@ internal class CallRecordingService : BackgroundService
 
                 if (shouldStartRecording)
                 {
-                    _logger.LogInformation("📞 Phase=Connected. Starting recording... source={src}", _callState.SourceProcess ?? "unknown");
+                    _logger.LogInformation("📞 Phase=Connected (edge). Starting recording... source={src}", _callState.SourceProcess ?? "unknown");
                     await _recManager.StartAsync(_callState.SourceProcess);
                 }
 

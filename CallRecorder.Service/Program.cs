@@ -7,8 +7,18 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Linq;
+using System.Threading;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+// Single-instance guard to prevent duplicate recorders
+bool createdNew;
+using var singleInstanceMutex = new System.Threading.Mutex(true, "Global\\CallRecorderService_SingleInstance", out createdNew);
+if (!createdNew)
+{
+    Console.WriteLine("Another instance of CallRecorderService is already running. Exiting.");
+    return;
+}
 
 // Run as a Windows Service when deployed; harmless when running under VS
 builder.Services.AddWindowsService(options =>

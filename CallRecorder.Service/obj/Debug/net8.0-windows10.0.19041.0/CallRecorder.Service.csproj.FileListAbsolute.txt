@@ -59,3 +59,4 @@ C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Service\obj\Debug\
 C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Service\obj\Debug\net8.0-windows10.0.19041.0\CallRecorder.Service.pdb
 C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Service\obj\Debug\net8.0-windows10.0.19041.0\CallRecorder.Service.genruntimeconfig.cache
 C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Service\obj\Debug\net8.0-windows10.0.19041.0\ref\CallRecorder.Service.dll
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Service\obj\Debug\net8.0-windows10.0.19041.0\CallRecorder.Service.sourcelink.json
