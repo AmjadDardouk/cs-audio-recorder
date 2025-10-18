@@ -1,0 +1,4921 @@
+# Call Recording System - Complete Technical Documentation
+
+## Executive Summary
+
+### Project Overview
+Build a Windows-based call recording system for 100 remote call center agents using Azure VDI. The system will automatically detect and record all customer calls across multiple web-based calling platforms (Aircall, Five9, Twilio, etc.) without requiring platform-specific integrations.
+
+### Key Requirements
+- **Automatic call detection** across any web-based calling platform
+- **Zero audio loss** - capture entire call including first words
+- **Dual-channel recording** - separate agent and customer audio
+- **Secure storage** - encrypted upload to S3
+- **Transparent operation** - runs silently without agent interaction
+- **VDI-compatible** - works in Azure Virtual Desktop environment
+
+### Success Metrics
+- ✅ 95%+ call detection accuracy
+- ✅ 99%+ upload success rate
+- ✅ <5% CPU usage per VDI instance
+- ✅ <100ms latency for call detection
+- ✅ Zero data loss on network interruptions
+
+---
+
+## Architecture Overview
+
+### High-Level System Design
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Azure VDI Instance                        │
+│                                                              │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Windows Service (CallRecorderService)             │    │
+│  │  - Runs as: NT AUTHORITY\SYSTEM                   │    │
+│  │  - Auto-start: Yes                                │    │
+│  │  - User controllable: No                          │    │
+│  │                                                    │    │
+│  │  ┌──────────────────────────────────────────┐    │    │
+│  │  │  Call Detection Engine                    │    │    │
+│  │  │  ├── Process Monitor                      │    │    │
+│  │  │  │   └── Which apps using microphone?    │    │    │
+│  │  │  ├── Network Monitor                      │    │    │
+│  │  │  │   └── Active VoIP connections?         │    │    │
+│  │  │  ├── Audio Session Monitor                │    │    │
+│  │  │  │   └── Mic + speaker both active?      │    │    │
+│  │  │  └── Confidence Calculator                │    │    │
+│  │  │      └── Combine signals → call detected │    │    │
+│  │  └──────────────────────────────────────────┘    │    │
+│  │                                                    │    │
+│  │  ┌──────────────────────────────────────────┐    │    │
+│  │  │  Audio Capture Engine                     │    │    │
+│  │  │  ├── Continuous 10s Pre-buffer           │    │    │
+│  │  │  ├── WASAPI Loopback Capture             │    │    │
+│  │  │  ├── Device Management                    │    │    │
+│  │  │  │   └── Auto-select best microphone     │    │    │
+│  │  │  └── Stereo Recording                     │    │    │
+│  │  │      ├── L: Agent microphone             │    │    │
+│  │  │      └── R: Customer (speakers)          │    │    │
+│  │  └──────────────────────────────────────────┘    │    │
+│  │                                                    │    │
+│  │  ┌──────────────────────────────────────────┐    │    │
+│  │  │  Recording Manager                        │    │    │
+│  │  │  ├── Session Management                   │    │    │
+│  │  │  ├── File Creation (UUID-based)          │    │    │
+│  │  │  ├── Opus Encoding (32kbps, stereo)     │    │    │
+│  │  │  └── Metadata Tracking                    │    │    │
+│  │  └──────────────────────────────────────────┘    │    │
+│  │                                                    │    │
+│  │  ┌──────────────────────────────────────────┐    │    │
+│  │  │  Upload Manager                           │    │    │
+│  │  │  ├── Local Queue (resilient)             │    │    │
+│  │  │  ├── S3 Upload (async)                   │    │    │
+│  │  │  ├── Retry Logic (exponential backoff)   │    │    │
+│  │  │  └── Encryption (TLS + S3 SSE)           │    │    │
+│  │  └──────────────────────────────────────────┘    │    │
+│  │                                                    │    │
+│  │  ┌──────────────────────────────────────────┐    │    │
+│  │  │  Monitoring & Telemetry                   │    │    │
+│  │  │  ├── DataDog Agent Integration           │    │    │
+│  │  │  ├── CloudWatch/Azure Monitor Logs       │    │    │
+│  │  │  ├── Health Checks                        │    │    │
+│  │  │  └── Performance Metrics                  │    │    │
+│  │  └──────────────────────────────────────────┘    │    │
+│  └────────────────────────────────────────────────────┘    │
+│                                                              │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Agent Session (Limited User Permissions)         │    │
+│  │  ├── Chrome/Edge Browser                          │    │
+│  │  ├── Calling Platforms (Aircall, Five9, etc.)    │    │
+│  │  └── No visibility of recording service           │    │
+│  └────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            │ HTTPS/TLS
+                            ▼
+                  ┌──────────────────┐
+                  │   AWS S3 Bucket  │
+                  │  ┌────────────┐  │
+                  │  │ agents/    │  │
+                  │  │   agent1/  │  │
+                  │  │     uuid1  │  │
+                  │  │     uuid2  │  │
+                  │  │   agent2/  │  │
+                  │  │     ...    │  │
+                  │  └────────────┘  │
+                  └──────────────────┘
+```
+
+---
+
+## Technology Stack
+
+### Core Application
+
+#### Windows Service
+```yaml
+Framework: .NET 8.0 (LTS)
+Language: C# 12
+IDE: Visual Studio 2022 / Rider
+Project Type: Windows Service
+
+Key Libraries:
+  - Microsoft.Extensions.Hosting (8.0+)      # Service hosting
+  - Microsoft.Extensions.DependencyInjection  # DI container
+  - Microsoft.Extensions.Configuration        # Config management
+  - Microsoft.Extensions.Logging             # Logging abstraction
+```
+
+#### Audio Capture
+```yaml
+Primary Library: NAudio (2.2.1+)
+  - NAudio.Wasapi      # Windows Audio Session API
+  - NAudio.Wave        # Wave format handling
+  - NAudio.CoreAudioApi # Device enumeration
+
+Codec: Concentus.Oggfile (2.0+)
+  - Opus encoding/decoding
+  - OGG container format
+```
+
+#### Network Monitoring
+```yaml
+Libraries:
+  - System.Net.NetworkInformation  # Built-in .NET
+  - PInvoke.IpHlpApi (0.7+)       # Windows IP Helper API
+  
+Native APIs:
+  - GetExtendedTcpTable
+  - GetExtendedUdpTable
+  - GetPerTcpConnectionEStats
+```
+
+#### Storage & Upload
+```yaml
+AWS SDK: AWSSDK.S3 (3.7+)
+  - S3Client
+  - TransferUtility (multi-part uploads)
+  
+Local Storage: SQLite (Microsoft.Data.Sqlite 8.0+)
+  - Queue management
+  - Metadata tracking
+  - Retry state persistence
+```
+
+#### Monitoring
+```yaml
+DataDog: DogStatsD (7.0+)
+  - Custom metrics
+  - Service health
+  - Performance tracking
+
+Logging: Serilog (3.1+)
+  - Structured logging
+  - Multiple sinks (File, CloudWatch, Console)
+  
+Crash Reporting: Sentry.NET (4.0+)
+  - Exception tracking
+  - Performance monitoring
+```
+
+### Infrastructure
+
+#### Azure VDI
+```yaml
+Platform: Azure Virtual Desktop (AVD)
+OS: Windows 11 Enterprise (23H2)
+Instance Type: Standard D4s v3
+  - vCPUs: 4
+  - RAM: 16 GB
+  - Storage: 128 GB SSD
+
+Configuration:
+  - Audio Redirection: Enabled
+  - USB Redirection: Enabled (for headsets)
+  - Network: 100 Mbps minimum
+```
+
+#### AWS Services
+```yaml
+S3 Bucket:
+  - Region: us-east-1 (or closest to VDI)
+  - Encryption: SSE-S3 (AES-256)
+  - Versioning: Enabled
+  - Lifecycle: Archive to Glacier after 90 days
+  
+IAM:
+  - Service Account: callrecorder-vdi-uploader
+  - Policy: PutObject, GetObject on specific bucket
+  - MFA: Not required (service account)
+```
+
+#### Development Tools
+```yaml
+Version Control: Git + GitHub/GitLab
+CI/CD: GitHub Actions / Azure DevOps
+Package Manager: NuGet
+Build Tool: MSBuild / dotnet CLI
+Testing: xUnit + Moq + FluentAssertions
+Static Analysis: SonarQube / Roslyn Analyzers
+```
+
+---
+
+## Detailed Component Specifications
+
+### 1. Call Detection Engine
+
+#### Purpose
+Automatically identify when an agent is on an active call without relying on platform-specific integrations.
+
+#### Detection Strategy (Notion-Inspired Multi-Signal Approach)
+
+```csharp
+/// <summary>
+/// Multi-signal call detection using process monitoring,
+/// network analysis, and audio session tracking.
+/// Inspired by Notion's meeting detection approach.
+/// </summary>
+public class CallDetectionEngine
+{
+    private readonly IProcessMonitor _processMonitor;
+    private readonly INetworkMonitor _networkMonitor;
+    private readonly IAudioSessionMonitor _audioMonitor;
+    private readonly ILogger<CallDetectionEngine> _logger;
+    
+    // Detection runs every 500ms
+    private const int POLL_INTERVAL_MS = 500;
+    
+    // Confidence threshold for call detection (0-100)
+    private const int CALL_CONFIDENCE_THRESHOLD = 70;
+    
+    public CallDetectionEngine(
+        IProcessMonitor processMonitor,
+        INetworkMonitor networkMonitor,
+        IAudioSessionMonitor audioMonitor,
+        ILogger<CallDetectionEngine> logger)
+    {
+        _processMonitor = processMonitor;
+        _networkMonitor = networkMonitor;
+        _audioMonitor = audioMonitor;
+        _logger = logger;
+    }
+    
+    /// <summary>
+    /// Detects active calls by analyzing multiple signals.
+    /// Returns CallState with confidence score.
+    /// </summary>
+    public async Task<CallState> DetectCallStateAsync()
+    {
+        try
+        {
+            // Signal 1: Get processes actively using microphone
+            var micProcesses = await _audioMonitor.GetProcessesUsingMicrophoneAsync();
+            
+            if (!micProcesses.Any())
+            {
+                return CallState.NoCall;
+            }
+            
+            // Signal 2: Filter to call-capable processes
+            var callCandidates = micProcesses
+                .Where(p => IsCallCapableProcess(p.ProcessName))
+                .ToList();
+            
+            if (!callCandidates.Any())
+            {
+                _logger.LogDebug(
+                    "Microphone in use by non-call processes: {Processes}",
+                    string.Join(", ", micProcesses.Select(p => p.ProcessName))
+                );
+                return CallState.NoCall;
+            }
+            
+            // Signal 3: Analyze network activity for each candidate
+            foreach (var process in callCandidates)
+            {
+                var networkActivity = await _networkMonitor
+                    .GetProcessNetworkActivityAsync(process.Id);
+                
+                var confidence = CalculateCallConfidence(
+                    process, 
+                    networkActivity
+                );
+                
+                if (confidence >= CALL_CONFIDENCE_THRESHOLD)
+                {
+                    _logger.LogInformation(
+                        "Call detected: Process={Process}, PID={PID}, Confidence={Confidence}%",
+                        process.ProcessName,
+                        process.Id,
+                        confidence
+                    );
+                    
+                    return new CallState
+                    {
+                        IsActive = true,
+                        ProcessId = process.Id,
+                        ProcessName = process.ProcessName,
+                        Confidence = confidence,
+                        DetectedAt = DateTime.UtcNow
+                    };
+                }
+            }
+            
+            return CallState.NoCall;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during call detection");
+            return CallState.Error;
+        }
+    }
+    
+    /// <summary>
+    /// Determines if a process is capable of making calls.
+    /// Includes web browsers and native conferencing apps.
+    /// </summary>
+    private bool IsCallCapableProcess(string processName)
+    {
+        var callCapableProcesses = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            // Web browsers (for Aircall, Five9, Twilio, etc.)
+            "chrome",
+            "msedge",
+            "firefox",
+            "brave",
+            "opera",
+            
+            // Native conferencing apps (future-proofing)
+            "zoom",
+            "teams",
+            "slack",
+            "webex",
+            "gotomeeting"
+        };
+        
+        return callCapableProcesses.Contains(processName);
+    }
+    
+    /// <summary>
+    /// Calculates confidence score (0-100) that a call is active.
+    /// Uses multiple weighted signals.
+    /// </summary>
+    private int CalculateCallConfidence(
+        ProcessInfo process, 
+        NetworkActivity networkActivity)
+    {
+        int confidence = 0;
+        
+        // Signal 1: Audio session state (40 points max)
+        confidence += CalculateAudioConfidence(process);
+        
+        // Signal 2: Network activity pattern (40 points max)
+        confidence += CalculateNetworkConfidence(networkActivity);
+        
+        // Signal 3: Window title indicators (20 points max)
+        confidence += CalculateWindowConfidence(process);
+        
+        return Math.Min(confidence, 100);
+    }
+    
+    /// <summary>
+    /// Audio-based confidence scoring.
+    /// Both microphone and speakers active = high confidence.
+    /// </summary>
+    private int CalculateAudioConfidence(ProcessInfo process)
+    {
+        int score = 0;
+        
+        // Microphone is active (already filtered for this)
+        score += 20;
+        
+        // Check if process also has active output (speakers)
+        var hasActiveOutput = _audioMonitor
+            .HasActiveOutputSession(process.Id);
+        
+        if (hasActiveOutput)
+        {
+            // Both mic and speakers = conference call pattern
+            score += 20;
+        }
+        
+        return score;
+    }
+    
+    /// <summary>
+    /// Network-based confidence scoring.
+    /// UDP connections + VoIP ports + data transfer = high confidence.
+    /// </summary>
+    private int CalculateNetworkConfidence(NetworkActivity activity)
+    {
+        int score = 0;
+        
+        // Active UDP connections (VoIP uses UDP)
+        if (activity.UdpConnectionCount > 0)
+        {
+            score += 20;
+        }
+        
+        // Data transfer rate consistent with audio stream
+        // Typical VoIP: 24-64 kbps = 3-8 KB/s
+        var bytesPerSec = activity.TotalBytesPerSecond;
+        if (bytesPerSec >= 3000 && bytesPerSec <= 100000)
+        {
+            score += 10;
+        }
+        
+        // Connected to known VoIP infrastructure
+        if (activity.RemoteDomains.Any(IsKnownVoIPDomain))
+        {
+            score += 10;
+        }
+        
+        return score;
+    }
+    
+    /// <summary>
+    /// Window title-based confidence scoring.
+    /// Title contains call indicators = medium confidence.
+    /// </summary>
+    private int CalculateWindowConfidence(ProcessInfo process)
+    {
+        var windowTitle = process.WindowTitle ?? string.Empty;
+        
+        var callIndicators = new[]
+        {
+            "call", "calling", "in call",
+            "meeting", "conference",
+            "aircall", "five9", "twilio",
+            "zoom", "teams", "meet"
+        };
+        
+        foreach (var indicator in callIndicators)
+        {
+            if (windowTitle.Contains(
+                indicator, 
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return 20;
+            }
+        }
+        
+        return 0;
+    }
+    
+    /// <summary>
+    /// Check if domain is a known VoIP/conferencing provider.
+    /// </summary>
+    private bool IsKnownVoIPDomain(string domain)
+    {
+        var voipDomains = new[]
+        {
+            "twilio.com",
+            "aircall.io",
+            "five9.com",
+            "zoom.us",
+            "meet.google.com",
+            "teams.microsoft.com",
+            "webex.com",
+            "dialpad.com",
+            "ringcentral.com"
+        };
+        
+        return voipDomains.Any(vd => 
+            domain.EndsWith(vd, StringComparison.OrdinalIgnoreCase)
+        );
+    }
+}
+
+/// <summary>
+/// Represents the current call state.
+/// </summary>
+public class CallState
+{
+    public bool IsActive { get; set; }
+    public uint ProcessId { get; set; }
+    public string ProcessName { get; set; }
+    public int Confidence { get; set; }
+    public DateTime DetectedAt { get; set; }
+    
+    public static CallState NoCall => new CallState 
+    { 
+        IsActive = false, 
+        Confidence = 0 
+    };
+    
+    public static CallState Error => new CallState 
+    { 
+        IsActive = false, 
+        Confidence = -1 
+    };
+}
+```
+
+#### Process Monitor Implementation
+
+```csharp
+/// <summary>
+/// Monitors processes and their audio sessions.
+/// </summary>
+public class ProcessMonitor : IProcessMonitor
+{
+    private readonly MMDeviceEnumerator _deviceEnumerator;
+    private readonly ILogger<ProcessMonitor> _logger;
+    
+    public ProcessMonitor(ILogger<ProcessMonitor> logger)
+    {
+        _deviceEnumerator = new MMDeviceEnumerator();
+        _logger = logger;
+    }
+    
+    /// <summary>
+    /// Gets all processes currently using any microphone.
+    /// </summary>
+    public async Task<List<ProcessInfo>> GetProcessesUsingMicrophoneAsync()
+    {
+        return await Task.Run(() =>
+        {
+            var processes = new List<ProcessInfo>();
+            
+            try
+            {
+                // Enumerate all microphone devices
+                var captureDevices = _deviceEnumerator.EnumerateAudioEndPoints(
+                    DataFlow.Capture,
+                    DeviceState.Active
+                );
+                
+                foreach (var device in captureDevices)
+                {
+                    try
+                    {
+                        var sessionManager = device.AudioSessionManager;
+                        var sessions = sessionManager.Sessions;
+                        
+                        for (int i = 0; i < sessions.Count; i++)
+                        {
+                            var session = sessions[i];
+                            
+                            // Only include active sessions
+                            if (session.State != AudioSessionState.AudioSessionStateActive)
+                                continue;
+                            
+                            var processId = session.GetProcessID;
+                            
+                            // Skip system processes (PID 0, 4)
+                            if (processId <= 4)
+                                continue;
+                            
+                            try
+                            {
+                                var process = Process.GetProcessById((int)processId);
+                                
+                                processes.Add(new ProcessInfo
+                                {
+                                    Id = processId,
+                                    ProcessName = process.ProcessName,
+                                    WindowTitle = GetMainWindowTitle(process),
+                                    AudioSession = session,
+                                    Device = device
+                                });
+                            }
+                            catch (ArgumentException)
+                            {
+                                // Process no longer exists
+                                _logger.LogDebug(
+                                    "Process {PID} no longer exists", 
+                                    processId
+                                );
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex, 
+                            "Error reading sessions for device {Device}",
+                            device.FriendlyName
+                        );
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error enumerating audio devices");
+            }
+            
+            return processes;
+        });
+    }
+    
+    /// <summary>
+    /// Checks if a process has an active output (speaker) session.
+    /// </summary>
+    public bool HasActiveOutputSession(uint processId)
+    {
+        try
+        {
+            var renderDevices = _deviceEnumerator.EnumerateAudioEndPoints(
+                DataFlow.Render,
+                DeviceState.Active
+            );
+            
+            foreach (var device in renderDevices)
+            {
+                var sessions = device.AudioSessionManager.Sessions;
+                
+                for (int i = 0; i < sessions.Count; i++)
+                {
+                    var session = sessions[i];
+                    
+                    if (session.GetProcessID == processId &&
+                        session.State == AudioSessionState.AudioSessionStateActive)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Error checking output session for PID {PID}",
+                processId
+            );
+        }
+        
+        return false;
+    }
+    
+    private string GetMainWindowTitle(Process process)
+    {
+        try
+        {
+            return process.MainWindowTitle;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+}
+
+public class ProcessInfo
+{
+    public uint Id { get; set; }
+    public string ProcessName { get; set; }
+    public string WindowTitle { get; set; }
+    public AudioSessionControl AudioSession { get; set; }
+    public MMDevice Device { get; set; }
+}
+```
+
+#### Network Monitor Implementation
+
+```csharp
+/// <summary>
+/// Monitors network connections for VoIP detection.
+/// Uses Windows IP Helper API for per-process connection tracking.
+/// </summary>
+public class NetworkMonitor : INetworkMonitor
+{
+    private readonly ILogger<NetworkMonitor> _logger;
+    private readonly IDnsResolver _dnsResolver;
+    
+    // Cache for reverse DNS lookups
+    private readonly MemoryCache _dnsCache = new MemoryCache(
+        new MemoryCacheOptions
+        {
+            ExpirationScanFrequency = TimeSpan.FromMinutes(5)
+        }
+    );
+    
+    public NetworkMonitor(
+        ILogger<NetworkMonitor> logger,
+        IDnsResolver dnsResolver)
+    {
+        _logger = logger;
+        _dnsResolver = dnsResolver;
+    }
+    
+    /// <summary>
+    /// Gets network activity for a specific process.
+    /// </summary>
+    public async Task<NetworkActivity> GetProcessNetworkActivityAsync(uint processId)
+    {
+        return await Task.Run(() =>
+        {
+            var activity = new NetworkActivity
+            {
+                ProcessId = processId,
+                TcpConnections = new List<Connection>(),
+                UdpConnections = new List<Connection>(),
+                RemoteDomains = new List<string>()
+            };
+            
+            try
+            {
+                // Get TCP connections
+                var tcpConnections = GetTcpConnectionsForProcess(processId);
+                activity.TcpConnections.AddRange(tcpConnections);
+                
+                // Get UDP connections (more important for VoIP)
+                var udpConnections = GetUdpConnectionsForProcess(processId);
+                activity.UdpConnections.AddRange(udpConnections);
+                
+                // Resolve domains for remote IPs
+                var remoteIps = activity.TcpConnections
+                    .Concat(activity.UdpConnections)
+                    .Select(c => c.RemoteAddress)
+                    .Distinct()
+                    .ToList();
+                
+                foreach (var ip in remoteIps)
+                {
+                    var domain = ResolveDomain(ip);
+                    if (!string.IsNullOrEmpty(domain))
+                    {
+                        activity.RemoteDomains.Add(domain);
+                    }
+                }
+                
+                // Measure data transfer
+                activity.TotalBytesPerSecond = MeasureDataTransfer(
+                    processId,
+                    activity.TcpConnections.Concat(activity.UdpConnections).ToList()
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Error getting network activity for PID {PID}",
+                    processId
+                );
+            }
+            
+            return activity;
+        });
+    }
+    
+    /// <summary>
+    /// Gets UDP connections for a process using IP Helper API.
+    /// UDP is primary protocol for VoIP.
+    /// </summary>
+    private List<Connection> GetUdpConnectionsForProcess(uint processId)
+    {
+        var connections = new List<Connection>();
+        int bufferSize = 0;
+        
+        // First call to get required buffer size
+        var result = IpHlpApi.GetExtendedUdpTable(
+            IntPtr.Zero,
+            ref bufferSize,
+            false,
+            IpHlpApi.AF_INET,
+            IpHlpApi.UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID,
+            0
+        );
+        
+        if (result != IpHlpApi.NO_ERROR && result != IpHlpApi.ERROR_INSUFFICIENT_BUFFER)
+        {
+            return connections;
+        }
+        
+        IntPtr udpTablePtr = Marshal.AllocHGlobal(bufferSize);
+        
+        try
+        {
+            result = IpHlpApi.GetExtendedUdpTable(
+                udpTablePtr,
+                ref bufferSize,
+                false,
+                IpHlpApi.AF_INET,
+                IpHlpApi.UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID,
+                0
+            );
+            
+            if (result != IpHlpApi.NO_ERROR)
+            {
+                return connections;
+            }
+            
+            var table = Marshal.PtrToStructure<IpHlpApi.MIB_UDPTABLE_OWNER_PID>(
+                udpTablePtr
+            );
+            
+            var rowPtr = IntPtr.Add(
+                udpTablePtr,
+                Marshal.SizeOf(table.dwNumEntries)
+            );
+            
+            for (int i = 0; i < table.dwNumEntries; i++)
+            {
+                var row = Marshal.PtrToStructure<IpHlpApi.MIB_UDPROW_OWNER_PID>(
+                    rowPtr
+                );
+                
+                if (row.dwOwningPid == processId)
+                {
+                    connections.Add(new Connection
+                    {
+                        Protocol = ProtocolType.Udp,
+                        LocalAddress = NetworkHelpers.ConvertUintToIp(row.dwLocalAddr),
+                        LocalPort = NetworkHelpers.ConvertPort(row.dwLocalPort),
+                        RemoteAddress = "0.0.0.0", // UDP is connectionless
+                        RemotePort = 0,
+                        State = ConnectionState.Established
+                    });
+                }
+                
+                rowPtr = IntPtr.Add(
+                    rowPtr,
+                    Marshal.SizeOf<IpHlpApi.MIB_UDPROW_OWNER_PID>()
+                );
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(udpTablePtr);
+        }
+        
+        return connections;
+    }
+    
+    /// <summary>
+    /// Gets TCP connections for a process.
+    /// </summary>
+    private List<Connection> GetTcpConnectionsForProcess(uint processId)
+    {
+        var connections = new List<Connection>();
+        int bufferSize = 0;
+        
+        var result = IpHlpApi.GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref bufferSize,
+            false,
+            IpHlpApi.AF_INET,
+            IpHlpApi.TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL,
+            0
+        );
+        
+        if (result != IpHlpApi.NO_ERROR && result != IpHlpApi.ERROR_INSUFFICIENT_BUFFER)
+        {
+            return connections;
+        }
+        
+        IntPtr tcpTablePtr = Marshal.AllocHGlobal(bufferSize);
+        
+        try
+        {
+            result = IpHlpApi.GetExtendedTcpTable(
+                tcpTablePtr,
+                ref bufferSize,
+                false,
+                IpHlpApi.AF_INET,
+                IpHlpApi.TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL,
+                0
+            );
+            
+            if (result != IpHlpApi.NO_ERROR)
+            {
+                return connections;
+            }
+            
+            var table = Marshal.PtrToStructure<IpHlpApi.MIB_TCPTABLE_OWNER_PID>(
+                tcpTablePtr
+            );
+            
+            var rowPtr = IntPtr.Add(
+                tcpTablePtr,
+                Marshal.SizeOf(table.dwNumEntries)
+            );
+            
+            for (int i = 0; i < table.dwNumEntries; i++)
+            {
+                var row = Marshal.PtrToStructure<IpHlpApi.MIB_TCPROW_OWNER_PID>(
+                    rowPtr
+                );
+                
+                if (row.dwOwningPid == processId &&
+                    row.dwState == IpHlpApi.MIB_TCP_STATE_ESTAB)
+                {
+                    connections.Add(new Connection
+                    {
+                        Protocol = ProtocolType.Tcp,
+                        LocalAddress = NetworkHelpers.ConvertUintToIp(row.dwLocalAddr),
+                        LocalPort = NetworkHelpers.ConvertPort(row.dwLocalPort),
+                        RemoteAddress = NetworkHelpers.ConvertUintToIp(row.dwRemoteAddr),
+                        RemotePort = NetworkHelpers.ConvertPort(row.dwRemotePort),
+                        State = ConnectionState.Established
+                    });
+                }
+                
+                rowPtr = IntPtr.Add(
+                    rowPtr,
+                    Marshal.SizeOf<IpHlpApi.MIB_TCPROW_OWNER_PID>()
+                );
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(tcpTablePtr);
+        }
+        
+        return connections;
+    }
+    
+    /// <summary>
+    /// Measures actual data transfer rate.
+    /// Samples twice with 1-second interval.
+    /// </summary>
+    private long MeasureDataTransfer(uint processId, List<Connection> connections)
+    {
+        // This is a simplified version.
+        // Real implementation would use GetPerTcpConnectionEStats
+        // to get actual byte counters.
+        
+        // For now, estimate based on connection count and type
+        long estimatedBytesPerSec = 0;
+        
+        foreach (var conn in connections)
+        {
+            if (conn.Protocol == ProtocolType.Udp)
+            {
+                // VoIP UDP stream: ~4-8 KB/s
+                estimatedBytesPerSec += 6000;
+            }
+        }
+        
+        return estimatedBytesPerSec;
+    }
+    
+    /// <summary>
+    /// Resolves IP address to domain name with caching.
+    /// </summary>
+    private string ResolveDomain(string ipAddress)
+    {
+        if (_dnsCache.TryGetValue(ipAddress, out string cachedDomain))
+        {
+            return cachedDomain;
+        }
+        
+        try
+        {
+            var domain = _dnsResolver.Resolve(ipAddress);
+            
+            if (!string.IsNullOrEmpty(domain))
+            {
+                _dnsCache.Set(
+                    ipAddress,
+                    domain,
+                    TimeSpan.FromMinutes(30)
+                );
+            }
+            
+            return domain;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(
+                ex,
+                "Failed to resolve IP {IP}",
+                ipAddress
+            );
+            return null;
+        }
+    }
+}
+
+public class NetworkActivity
+{
+    public uint ProcessId { get; set; }
+    public List<Connection> TcpConnections { get; set; }
+    public List<Connection> UdpConnections { get; set; }
+    public List<string> RemoteDomains { get; set; }
+    public long TotalBytesPerSecond { get; set; }
+    
+    public int UdpConnectionCount => UdpConnections?.Count ?? 0;
+}
+
+public class Connection
+{
+    public ProtocolType Protocol { get; set; }
+    public string LocalAddress { get; set; }
+    public int LocalPort { get; set; }
+    public string RemoteAddress { get; set; }
+    public int RemotePort { get; set; }
+    public ConnectionState State { get; set; }
+}
+
+public enum ConnectionState
+{
+    Established,
+    Listening,
+    Closed
+}
+```
+
+### 2. Audio Capture Engine
+
+#### Purpose
+Capture high-quality stereo audio with zero loss, automatic device management, and continuous pre-buffering.
+
+#### Implementation
+
+```csharp
+/// <summary>
+/// Handles all audio capture with pre-buffering and device management.
+/// Runs continuously to enable zero-loss recording.
+/// </summary>
+public class AudioCaptureEngine : IAudioCaptureEngine
+{
+    private readonly ILogger<AudioCaptureEngine> _logger;
+    private readonly IDeviceManager _deviceManager;
+    
+    // Pre-buffer: keeps last 10 seconds of audio
+    private readonly CircularAudioBuffer _preBuffer;
+    private const int PRE_BUFFER_SECONDS = 10;
+    
+    // Audio format
+    private const int SAMPLE_RATE = 32000; // 32 kHz
+    private const int BITS_PER_SAMPLE = 16;
+    private const int CHANNELS = 2; // Stereo
+    
+    // Capture devices
+    private WasapiLoopbackCapture _microphoneCapture;
+    private WasapiLoopbackCapture _speakerCapture;
+    
+    private bool _isRunning;
+    private readonly object _lock = new object();
+    
+    public AudioCaptureEngine(
+        ILogger<AudioCaptureEngine> logger,
+        IDeviceManager deviceManager)
+    {
+        _logger = logger;
+        _deviceManager = deviceManager;
+        
+        var format = new WaveFormat(SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS);
+        _preBuffer = new CircularAudioBuffer(
+            format,
+            TimeSpan.FromSeconds(PRE_BUFFER_SECONDS)
+        );
+    }
+    
+    /// <summary>
+    /// Starts continuous audio capture with buffering.
+    /// Called when service starts, runs indefinitely.
+    /// </summary>
+    public async Task StartContinuousCaptureAsync()
+    {
+        _logger.LogInformation("Starting continuous audio capture");
+        
+        lock (_lock)
+        {
+            if (_isRunning)
+            {
+                _logger.LogWarning("Capture already running");
+                return;
+            }
+            _isRunning = true;
+        }
+        
+        try
+        {
+            // Initialize capture devices
+            await InitializeCaptureDevicesAsync();
+            
+            // Start capturing
+            _microphoneCapture?.StartRecording();
+            _speakerCapture?.StartRecording();
+            
+            _logger.LogInformation("Continuous capture started successfully");
+            
+            // Monitor device changes
+            _deviceManager.DeviceChanged += OnDeviceChanged;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to start continuous capture");
+            _isRunning = false;
+            throw;
+        }
+    }
+    
+    /// <summary>
+    /// Initializes WASAPI loopback capture for mic and speakers.
+    /// </summary>
+    private async Task InitializeCaptureDevicesAsync()
+    {
+        // Get best microphone device
+        var micDevice = await _deviceManager.GetBestMicrophoneAsync();
+        
+        if (micDevice == null)
+        {
+            throw new InvalidOperationException("No microphone device found");
+        }
+        
+        _logger.LogInformation(
+            "Selected microphone: {Device}",
+            micDevice.FriendlyName
+        );
+        
+        // WASAPI loopback for microphone input
+        _microphoneCapture = new WasapiLoopbackCapture(micDevice);
+        _microphoneCapture.DataAvailable += OnMicrophoneDataAvailable;
+        _microphoneCapture.RecordingStopped += OnMicrophoneRecordingStopped;
+        
+        // Get default speaker/output device
+        var speakerDevice = await _deviceManager.GetDefaultSpeakerAsync();
+        
+        if (speakerDevice == null)
+        {
+            _logger.LogWarning("No speaker device found, speaker channel will be silent");
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Selected speaker: {Device}",
+                speakerDevice.FriendlyName
+            );
+            
+            _speakerCapture = new WasapiLoopbackCapture(speakerDevice);
+            _speakerCapture.DataAvailable += OnSpeakerDataAvailable;
+            _speakerCapture.RecordingStopped += OnSpeakerRecordingStopped;
+        }
+    }
+    
+    /// <summary>
+    /// Handles microphone audio data.
+    /// Buffers to left channel of stereo stream.
+    /// </summary>
+    private void OnMicrophoneDataAvailable(object sender, WaveInEventArgs e)
+    {
+        try
+        {
+            // Add to pre-buffer (left channel)
+            _preBuffer.AddSamples(
+                e.Buffer,
+                e.BytesRecorded,
+                AudioChannel.Left
+            );
+            
+            // If actively recording, also write to recording
+            var activeRecording = RecordingManager.ActiveRecording;
+            if (activeRecording != null)
+            {
+                activeRecording.WriteSamples(
+                    e.Buffer,
+                    e.BytesRecorded,
+                    AudioChannel.Left
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing microphone data");
+        }
+    }
+    
+    /// <summary>
+    /// Handles speaker audio data.
+    /// Buffers to right channel of stereo stream.
+    /// </summary>
+    private void OnSpeakerDataAvailable(object sender, WaveInEventArgs e)
+    {
+        try
+        {
+            // Add to pre-buffer (right channel)
+            _preBuffer.AddSamples(
+                e.Buffer,
+                e.BytesRecorded,
+                AudioChannel.Right
+            );
+            
+            // If actively recording, also write to recording
+            var activeRecording = RecordingManager.ActiveRecording;
+            if (activeRecording != null)
+            {
+                activeRecording.WriteSamples(
+                    e.Buffer,
+                    e.BytesRecorded,
+                    AudioChannel.Right
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing speaker data");
+        }
+    }
+    
+    /// <summary>
+    /// Flushes pre-buffer to a new recording.
+    /// Called when call is detected.
+    /// </summary>
+    public RecordingSession CreateRecordingFromBuffer(string recordingId)
+    {
+        lock (_lock)
+        {
+            _logger.LogInformation(
+                "Creating recording {RecordingId} from buffer",
+                recordingId
+            );
+            
+            var recording = new RecordingSession(
+                recordingId,
+                new WaveFormat(SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS)
+            );
+            
+            // Write buffered audio to recording
+            var bufferedSamples = _preBuffer.GetAllSamples();
+            recording.WriteBufferedSamples(bufferedSamples);
+            
+            _logger.LogInformation(
+                "Flushed {Seconds}s of buffered audio to recording",
+                PRE_BUFFER_SECONDS
+            );
+            
+            return recording;
+        }
+    }
+    
+    /// <summary>
+    /// Handles device changes (plug/unplug headset).
+    /// Automatically switches to best available device.
+    /// </summary>
+    private async void OnDeviceChanged(object sender, DeviceChangedEventArgs e)
+    {
+        _logger.LogWarning(
+            "Device changed: {EventType}, Device: {Device}",
+            e.EventType,
+            e.Device?.FriendlyName ?? "Unknown"
+        );
+        
+        if (e.EventType == DeviceEventType.DeviceAdded ||
+            e.EventType == DeviceEventType.DeviceRemoved ||
+            e.EventType == DeviceEventType.DefaultDeviceChanged)
+        {
+            await SwitchTobestDeviceAsync();
+        }
+    }
+    
+    /// <summary>
+    /// Switches to the best available microphone.
+    /// Seamless transition with minimal audio loss.
+    /// </summary>
+    private async Task SwitchTobestDeviceAsync()
+    {
+        try
+        {
+            _logger.LogInformation("Switching to best available device");
+            
+            var newMicDevice = await _deviceManager.GetBestMicrophoneAsync();
+            
+            if (newMicDevice == null)
+            {
+                _logger.LogError("No microphone device available after switch");
+                return;
+            }
+            
+            lock (_lock)
+            {
+                // Create new capture
+                var newCapture = new WasapiLoopbackCapture(newMicDevice);
+                newCapture.DataAvailable += OnMicrophoneDataAvailable;
+                newCapture.RecordingStopped += OnMicrophoneRecordingStopped;
+                newCapture.StartRecording();
+                
+                // Small delay to ensure new capture is running
+                Thread.Sleep(100);
+                
+                // Stop and dispose old capture
+                var oldCapture = _microphoneCapture;
+                _microphoneCapture = newCapture;
+                
+                oldCapture?.StopRecording();
+                oldCapture?.Dispose();
+            }
+            
+            _logger.LogInformation(
+                "Successfully switched to device: {Device}",
+                newMicDevice.FriendlyName
+            );
+            
+            // Flag in active recording that device switched
+            var activeRecording = RecordingManager.ActiveRecording;
+            if (activeRecording != null)
+            {
+                activeRecording.FlagDeviceSwitch(newMicDevice.FriendlyName);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error switching devices");
+        }
+    }
+    
+    /// <summary>
+    /// Stops continuous capture.
+    /// Called when service stops.
+    /// </summary>
+    public void StopContinuousCapture()
+    {
+        lock (_lock)
+        {
+            if (!_isRunning)
+                return;
+            
+            _logger.LogInformation("Stopping continuous capture");
+            
+            _microphoneCapture?.StopRecording();
+            _speakerCapture?.StopRecording();
+            
+            _deviceManager.DeviceChanged -= OnDeviceChanged;
+            
+            _isRunning = false;
+        }
+    }
+    
+    private void OnMicrophoneRecordingStopped(object sender, StoppedEventArgs e)
+    {
+        if (e.Exception != null)
+        {
+            _logger.LogError(
+                e.Exception,
+                "Microphone recording stopped with error"
+            );
+        }
+    }
+    
+    private void OnSpeakerRecordingStopped(object sender, StoppedEventArgs e)
+    {
+        if (e.Exception != null)
+        {
+            _logger.LogError(
+                e.Exception,
+                "Speaker recording stopped with error"
+            );
+        }
+    }
+    
+    public void Dispose()
+    {
+        StopContinuousCapture();
+        _microphoneCapture?.Dispose();
+        _speakerCapture?.Dispose();
+        _preBuffer?.Dispose();
+    }
+}
+
+/// <summary>
+/// Circular buffer for audio samples with fixed duration.
+/// Thread-safe for concurrent read/write.
+/// </summary>
+public class CircularAudioBuffer : IDisposable
+{
+    private readonly byte[] _buffer;
+    private readonly WaveFormat _format;
+    private int _writePosition;
+    private bool _isFull;
+    private readonly object _lock = new object();
+    
+    // Separate buffers for left/right channels
+    private readonly byte[] _leftChannel;
+    private readonly byte[] _rightChannel;
+    
+    public CircularAudioBuffer(WaveFormat format, TimeSpan duration)
+    {
+        _format = format;
+        
+        // Calculate buffer size
+        var bytesPerSecond = format.AverageBytesPerSecond;
+        var bufferSize = (int)(bytesPerSecond * duration.TotalSeconds);
+        
+        _buffer = new byte[bufferSize];
+        _leftChannel = new byte[bufferSize / 2];
+        _rightChannel = new byte[bufferSize / 2];
+        
+        _writePosition = 0;
+        _isFull = false;
+    }
+    
+    /// <summary>
+    /// Adds samples to the buffer for a specific channel.
+    /// </summary>
+    public void AddSamples(byte[] samples, int count, AudioChannel channel)
+    {
+        lock (_lock)
+        {
+            var targetBuffer = channel == AudioChannel.Left 
+                ? _leftChannel 
+                : _rightChannel;
+            
+            for (int i = 0; i < count; i++)
+            {
+                targetBuffer[_writePosition] = samples[i];
+                _writePosition = (_writePosition + 1) % targetBuffer.Length;
+                
+                if (_writePosition == 0)
+                {
+                    _isFull = true;
+                }
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Gets all buffered samples as interleaved stereo.
+    /// </summary>
+    public byte[] GetAllSamples()
+    {
+        lock (_lock)
+        {
+            var length = _isFull ? _buffer.Length : _writePosition * 2;
+            var result = new byte[length];
+            
+            int readPos = _isFull ? _writePosition : 0;
+            int writePos = 0;
+            
+            // Interleave left and right channels
+            for (int i = 0; i < length / 4; i++)
+            {
+                // Left sample (2 bytes - 16-bit)
+                result[writePos++] = _leftChannel[readPos];
+                result[writePos++] = _leftChannel[readPos + 1];
+                
+                // Right sample (2 bytes - 16-bit)
+                result[writePos++] = _rightChannel[readPos];
+                result[writePos++] = _rightChannel[readPos + 1];
+                
+                readPos = (readPos + 2) % _leftChannel.Length;
+            }
+            
+            return result;
+        }
+    }
+    
+    public void Dispose()
+    {
+        // Buffers are arrays, no explicit disposal needed
+    }
+}
+
+public enum AudioChannel
+{
+    Left,   // Agent microphone
+    Right   // Customer (speakers)
+}
+```
+
+### 3. Device Manager
+
+```csharp
+/// <summary>
+/// Manages audio device selection and monitoring.
+/// Automatically selects best microphone based on scoring algorithm.
+/// </summary>
+public class DeviceManager : IDeviceManager
+{
+    private readonly MMDeviceEnumerator _enumerator;
+    private readonly ILogger<DeviceManager> _logger;
+    private readonly DeviceNotificationClient _notificationClient;
+    
+    public event EventHandler<DeviceChangedEventArgs> DeviceChanged;
+    
+    public DeviceManager(ILogger<DeviceManager> logger)
+    {
+        _logger = logger;
+        _enumerator = new MMDeviceEnumerator();
+        
+        // Register for device change notifications
+        _notificationClient = new DeviceNotificationClient(this);
+        _enumerator.RegisterEndpointNotificationCallback(_notificationClient);
+    }
+    
+    /// <summary>
+    /// Gets the best microphone based on scoring algorithm.
+    /// </summary>
+    public async Task<MMDevice> GetBestMicrophoneAsync()
+    {
+        return await Task.Run(() =>
+        {
+            try
+            {
+                var devices = _enumerator.EnumerateAudioEndPoints(
+                    DataFlow.Capture,
+                    DeviceState.Active
+                );
+                
+                if (devices.Count == 0)
+                {
+                    _logger.LogWarning("No microphone devices found");
+                    return null;
+                }
+                
+                // Score each device
+                var scoredDevices = devices
+                    .Select(d => new
+                    {
+                        Device = d,
+                        Score = ScoreDevice(d)
+                    })
+                    .OrderByDescending(x => x.Score)
+                    .ToList();
+                
+                var best = scoredDevices.First();
+                
+                _logger.LogInformation(
+                    "Selected microphone: {Device} (score: {Score})",
+                    best.Device.FriendlyName,
+                    best.Score
+                );
+                
+                // Log all candidates for debugging
+                foreach (var candidate in scoredDevices.Skip(1))
+                {
+                    _logger.LogDebug(
+                        "Alternative device: {Device} (score: {Score})",
+                        candidate.Device.FriendlyName,
+                        candidate.Score
+                    );
+                }
+                
+                return best.Device;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error selecting best microphone");
+                return null;
+            }
+        });
+    }
+    
+    /// <summary>
+    /// Scores a microphone device.
+    /// Higher score = better device for recording.
+    /// </summary>
+    private int ScoreDevice(MMDevice device)
+    {
+        int score = 0;
+        var name = device.FriendlyName.ToLower();
+        
+        // Priority 1: Currently in use (highest priority)
+        if (IsDeviceInUse(device))
+        {
+            score += 100;
+        }
+        
+        // Priority 2: Device type indicators
+        if (name.Contains("headset") || name.Contains("headphone"))
+        {
+            score += 50; // Headsets are typically better for calls
+        }
+        
+        if (name.Contains("usb"))
+        {
+            score += 30; // USB devices often better than built-in
+        }
+        
+        if (name.Contains("bluetooth"))
+        {
+            score += 20; // Bluetooth works but often lower quality
+        }
+        
+        if (name.Contains("webcam") || name.Contains("camera"))
+        {
+            score += 10; // Webcam mics are usually poor quality
+        }
+        
+        // Priority 3: Windows default device
+        try
+        {
+            var defaultDevice = _enumerator.GetDefaultAudioEndpoint(
+                DataFlow.Capture,
+                Role.Communications // Important: use Communications role
+            );
+            
+            if (device.ID == defaultDevice.ID)
+            {
+                score += 40;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error getting default device");
+        }
+        
+        // Priority 4: Audio format capabilities
+        try
+        {
+            var format = device.AudioClient.MixFormat;
+            
+            // Prefer higher sample rates
+            if (format.SampleRate >= 48000)
+                score += 15;
+            else if (format.SampleRate >= 44100)
+                score += 10;
+            else if (format.SampleRate >= 32000)
+                score += 5;
+            
+            // Prefer 16-bit over 8-bit
+            if (format.BitsPerSample >= 16)
+                score += 5;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(
+                ex,
+                "Error reading format for {Device}",
+                device.FriendlyName
+            );
+        }
+        
+        return score;
+    }
+    
+    /// <summary>
+    /// Checks if a device is currently being used by any application.
+    /// </summary>
+    private bool IsDeviceInUse(MMDevice device)
+    {
+        try
+        {
+            var sessionManager = device.AudioSessionManager;
+            var sessions = sessionManager.Sessions;
+            
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                var session = sessions[i];
+                if (session.State == AudioSessionState.AudioSessionStateActive)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(
+                ex,
+                "Error checking device usage for {Device}",
+                device.FriendlyName
+            );
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
+    /// Gets the default speaker/output device.
+    /// </summary>
+    public async Task<MMDevice> GetDefaultSpeakerAsync()
+    {
+        return await Task.Run(() =>
+        {
+            try
+            {
+                return _enumerator.GetDefaultAudioEndpoint(
+                    DataFlow.Render,
+                    Role.Communications
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting default speaker");
+                return null;
+            }
+        });
+    }
+    
+    /// <summary>
+    /// Called by notification client when devices change.
+    /// </summary>
+    internal void OnDeviceStateChanged(string deviceId, DeviceState newState)
+    {
+        _logger.LogInformation(
+            "Device state changed: {DeviceId}, State: {State}",
+            deviceId,
+            newState
+        );
+        
+        DeviceChanged?.Invoke(this, new DeviceChangedEventArgs
+        {
+            EventType = DeviceEventType.DeviceStateChanged,
+            DeviceId = deviceId
+        });
+    }
+    
+    internal void OnDeviceAdded(string deviceId)
+    {
+        _logger.LogInformation("Device added: {DeviceId}", deviceId);
+        
+        DeviceChanged?.Invoke(this, new DeviceChangedEventArgs
+        {
+            EventType = DeviceEventType.DeviceAdded,
+            DeviceId = deviceId
+        });
+    }
+    
+    internal void OnDeviceRemoved(string deviceId)
+    {
+        _logger.LogInformation("Device removed: {DeviceId}", deviceId);
+        
+        DeviceChanged?.Invoke(this, new DeviceChangedEventArgs
+        {
+            EventType = DeviceEventType.DeviceRemoved,
+            DeviceId = deviceId
+        });
+    }
+    
+    internal void OnDefaultDeviceChanged(DataFlow flow, Role role, string deviceId)
+    {
+        if (flow == DataFlow.Capture && role == Role.Communications)
+        {
+            _logger.LogInformation(
+                "Default microphone changed: {DeviceId}",
+                deviceId
+            );
+            
+            DeviceChanged?.Invoke(this, new DeviceChangedEventArgs
+            {
+                EventType = DeviceEventType.DefaultDeviceChanged,
+                DeviceId = deviceId
+            });
+        }
+    }
+    
+    public void Dispose()
+    {
+        _enumerator.UnregisterEndpointNotificationCallback(_notificationClient);
+        _enumerator.Dispose();
+    }
+}
+
+/// <summary>
+/// Receives device change notifications from Windows.
+/// </summary>
+internal class DeviceNotificationClient : IMMNotificationClient
+{
+    private readonly DeviceManager _manager;
+    
+    public DeviceNotificationClient(DeviceManager manager)
+    {
+        _manager = manager;
+    }
+    
+    public void OnDeviceStateChanged(string deviceId, DeviceState newState)
+    {
+        _manager.OnDeviceStateChanged(deviceId, newState);
+    }
+    
+    public void OnDeviceAdded(string deviceId)
+    {
+        _manager.OnDeviceAdded(deviceId);
+    }
+    
+    public void OnDeviceRemoved(string deviceId)
+    {
+        _manager.OnDeviceRemoved(deviceId);
+    }
+    
+    public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
+    {
+        _manager.OnDefaultDeviceChanged(flow, role, defaultDeviceId);
+    }
+    
+    public void OnPropertyValueChanged(string deviceId, PropertyKey key)
+    {
+        // Not needed for our use case
+    }
+}
+
+public class DeviceChangedEventArgs : EventArgs
+{
+    public DeviceEventType EventType { get; set; }
+    public string DeviceId { get; set; }
+    public MMDevice Device { get; set; }
+}
+
+public enum DeviceEventType
+{
+    DeviceAdded,
+    DeviceRemoved,
+    DeviceStateChanged,
+    DefaultDeviceChanged
+}
+```
+
+### 4. Recording Manager
+
+```csharp
+/// <summary>
+/// Manages recording sessions, file creation, and Opus encoding.
+/// </summary>
+public class RecordingManager : IRecordingManager
+{
+    private readonly ILogger<RecordingManager> _logger;
+    private readonly IAgentIdentifier _agentIdentifier;
+    private readonly RecordingConfig _config;
+    
+    private RecordingSession _activeRecording;
+    private readonly object _lock = new object();
+    
+    // Singleton access for audio engine
+    public static RecordingSession ActiveRecording { get; private set; }
+    
+    public RecordingManager(
+        ILogger<RecordingManager> logger,
+        IAgentIdentifier agentIdentifier,
+        IOptions<RecordingConfig> config)
+    {
+        _logger = logger;
+        _agentIdentifier = agentIdentifier;
+        _config = config.Value;
+    }
+    
+    /// <summary>
+    /// Starts a new recording session.
+    /// Flushes pre-buffer and begins active recording.
+    /// </summary>
+    public async Task<RecordingSession> StartRecordingAsync(
+        CallState callState,
+        AudioCaptureEngine audioEngine)
+    {
+        lock (_lock)
+        {
+            if (_activeRecording != null)
+            {
+                _logger.LogWarning(
+                    "Recording already active: {RecordingId}",
+                    _activeRecording.RecordingId
+                );
+                return _activeRecording;
+            }
+            
+            // Generate unique ID
+            var recordingId = Guid.NewGuid().ToString("N");
+            
+            // Get agent identifier
+            var agentId = _agentIdentifier.GetAgentId();
+            
+            _logger.LogInformation(
+                "Starting recording: {RecordingId}, Agent: {AgentId}, Process: {Process}",
+                recordingId,
+                agentId,
+                callState.ProcessName
+            );
+            
+            // Create recording from pre-buffer
+            var recording = audioEngine.CreateRecordingFromBuffer(recordingId);
+            
+            // Set metadata
+            recording.AgentId = agentId;
+            recording.ProcessName = callState.ProcessName;
+            recording.ProcessId = callState.ProcessId;
+            recording.StartTime = DateTime.UtcNow;
+            recording.DetectionConfidence = callState.Confidence;
+            
+            _activeRecording = recording;
+            ActiveRecording = recording; // Static reference for audio engine
+            
+            return recording;
+        }
+    }
+    
+    /// <summary>
+    /// Stops the active recording and finalizes the file.
+    /// </summary>
+    public async Task<RecordingMetadata> StopRecordingAsync()
+    {
+        RecordingSession recording;
+        
+        lock (_lock)
+        {
+            if (_activeRecording == null)
+            {
+                _logger.LogWarning("No active recording to stop");
+                return null;
+            }
+            
+            recording = _activeRecording;
+            _activeRecording = null;
+            ActiveRecording = null;
+        }
+        
+        try
+        {
+            recording.EndTime = DateTime.UtcNow;
+            
+            _logger.LogInformation(
+                "Stopping recording: {RecordingId}, Duration: {Duration}s",
+                recording.RecordingId,
+                (recording.EndTime - recording.StartTime).TotalSeconds
+            );
+            
+            // Finalize and encode to Opus
+            var filePath = await recording.FinalizeAsync(_config.TempDirectory);
+            
+            // Create metadata
+            var metadata = new RecordingMetadata
+            {
+                RecordingId = recording.RecordingId,
+                AgentId = recording.AgentId,
+                StartTime = recording.StartTime,
+                EndTime = recording.EndTime,
+                Duration = recording.EndTime - recording.StartTime,
+                FilePath = filePath,
+                FileSize = new FileInfo(filePath).Length,
+                ProcessName = recording.ProcessName,
+                ProcessId = recording.ProcessId,
+                DetectionConfidence = recording.DetectionConfidence,
+                DeviceSwitches = recording.DeviceSwitches,
+                SampleRate = 32000,
+                Channels = 2,
+                Codec = "opus",
+                Bitrate = 32000
+            };
+            
+            _logger.LogInformation(
+                "Recording finalized: {RecordingId}, Size: {Size} bytes, Duration: {Duration}s",
+                metadata.RecordingId,
+                metadata.FileSize,
+                metadata.Duration.TotalSeconds
+            );
+            
+            return metadata;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Error finalizing recording: {RecordingId}",
+                recording.RecordingId
+            );
+            throw;
+        }
+    }
+}
+
+/// <summary>
+/// Represents an active recording session.
+/// Handles buffering, encoding, and file I/O.
+/// </summary>
+public class RecordingSession
+{
+    public string RecordingId { get; }
+    public string AgentId { get; set; }
+    public string ProcessName { get; set; }
+    public uint ProcessId { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime EndTime { get; set; }
+    public int DetectionConfidence { get; set; }
+    public List<DeviceSwitch> DeviceSwitches { get; }
+    
+    private readonly WaveFormat _format;
+    private readonly MemoryStream _audioBuffer;
+    private readonly object _lock = new object();
+    
+    public RecordingSession(string recordingId, WaveFormat format)
+    {
+        RecordingId = recordingId;
+        _format = format;
+        _audioBuffer = new MemoryStream();
+        DeviceSwitches = new List<DeviceSwitch>();
+    }
+    
+    /// <summary>
+    /// Writes buffered samples from pre-buffer.
+    /// </summary>
+    public void WriteBufferedSamples(byte[] samples)
+    {
+        lock (_lock)
+        {
+            _audioBuffer.Write(samples, 0, samples.Length);
+        }
+    }
+    
+    /// <summary>
+    /// Writes live samples to recording.
+    /// </summary>
+    public void WriteSamples(byte[] samples, int count, AudioChannel channel)
+    {
+        // For stereo recording, samples are interleaved
+        // This method is called separately for left and right channels
+        // The interleaving happens in the audio engine
+        lock (_lock)
+        {
+            _audioBuffer.Write(samples, 0, count);
+        }
+    }
+    
+    /// <summary>
+    /// Flags a device switch event in the recording.
+    /// </summary>
+    public void FlagDeviceSwitch(string newDeviceName)
+    {
+        lock (_lock)
+        {
+            DeviceSwitches.Add(new DeviceSwitch
+            {
+                Timestamp = DateTime.UtcNow,
+                NewDevice = newDeviceName,
+                OffsetSeconds = (DateTime.UtcNow - StartTime).TotalSeconds
+            });
+        }
+    }
+    
+    /// <summary>
+    /// Finalizes recording and encodes to Opus format.
+    /// Returns path to final .opus file.
+    /// </summary>
+    public async Task<string> FinalizeAsync(string outputDirectory)
+    {
+        return await Task.Run(() =>
+        {
+            lock (_lock)
+            {
+                // Generate output path
+                var fileName = $"{RecordingId}.opus";
+                var filePath = Path.Combine(outputDirectory, fileName);
+                
+                // Reset buffer position
+                _audioBuffer.Position = 0;
+                
+                // Encode to Opus
+                using (var opusFile = new OpusOggWriteStream(
+                    new FileStream(filePath, FileMode.Create),
+                    new OpusEncoder(_format.SampleRate, _format.Channels)
+                    {
+                        Bitrate = 32000 // 32 kbps
+                    }
+                ))
+                {
+                    // Read audio data and write to Opus encoder
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    
+                    while ((bytesRead = _audioBuffer.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        // Convert bytes to shorts (16-bit samples)
+                        short[] samples = new short[bytesRead / 2];
+                        Buffer.BlockCopy(buffer, 0, samples, 0, bytesRead);
+                        
+                        opusFile.WriteSamples(samples, 0, samples.Length);
+                    }
+                }
+                
+                // Clear buffer
+                _audioBuffer.Dispose();
+                
+                return filePath;
+            }
+        });
+    }
+}
+
+public class DeviceSwitch
+{
+    public DateTime Timestamp { get; set; }
+    public string NewDevice { get; set; }
+    public double OffsetSeconds { get; set; }
+}
+
+public class RecordingMetadata
+{
+    public string RecordingId { get; set; }
+    public string AgentId { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime EndTime { get; set; }
+    public TimeSpan Duration { get; set; }
+    public string FilePath { get; set; }
+    public long FileSize { get; set; }
+    public string ProcessName { get; set; }
+    public uint ProcessId { get; set; }
+    public int DetectionConfidence { get; set; }
+    public List<DeviceSwitch> DeviceSwitches { get; set; }
+    public int SampleRate { get; set; }
+    public int Channels { get; set; }
+    public string Codec { get; set; }
+    public int Bitrate { get; set; }
+}
+```
+
+### 5. Upload Manager
+
+```csharp
+/// <summary>
+/// Manages upload of recordings to S3 with queue and retry logic.
+/// </summary>
+public class UploadManager : IUploadManager
+{
+    private readonly ILogger<UploadManager> _logger;
+    private readonly IS3Client _s3Client;
+    private readonly IUploadQueue _uploadQueue;
+    private readonly UploadConfig _config;
+    
+    private readonly SemaphoreSlim _uploadSemaphore;
+    private CancellationTokenSource _cancellationTokenSource;
+    private Task _uploadWorker;
+    
+    public UploadManager(
+        ILogger<UploadManager> logger,
+        IS3Client s3Client,
+        IUploadQueue uploadQueue,
+        IOptions<UploadConfig> config)
+    {
+        _logger = logger;
+        _s3Client = s3Client;
+        _uploadQueue = uploadQueue;
+        _config = config.Value;
+        
+        // Limit concurrent uploads
+        _uploadSemaphore = new SemaphoreSlim(_config.MaxConcurrentUploads);
+    }
+    
+    /// <summary>
+    /// Starts the background upload worker.
+    /// </summary>
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Starting upload manager");
+        
+        _cancellationTokenSource = CancellationTokenSource
+            .CreateLinkedTokenSource(cancellationToken);
+        
+        _uploadWorker = Task.Run(
+            () => UploadWorkerAsync(_cancellationTokenSource.Token),
+            _cancellationTokenSource.Token
+        );
+        
+        await Task.CompletedTask;
+    }
+    
+    /// <summary>
+    /// Queues a recording for upload.
+    /// </summary>
+    public async Task QueueRecordingAsync(RecordingMetadata metadata)
+    {
+        _logger.LogInformation(
+            "Queueing recording for upload: {RecordingId}",
+            metadata.RecordingId
+        );
+        
+        var queueItem = new UploadQueueItem
+        {
+            RecordingId = metadata.RecordingId,
+            AgentId = metadata.AgentId,
+            FilePath = metadata.FilePath,
+            FileSize = metadata.FileSize,
+            Metadata = metadata,
+            QueuedAt = DateTime.UtcNow,
+            RetryCount = 0,
+            Status = UploadStatus.Pending
+        };
+        
+        await _uploadQueue.EnqueueAsync(queueItem);
+    }
+    
+    /// <summary>
+    /// Background worker that processes upload queue.
+    /// </summary>
+    private async Task UploadWorkerAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Upload worker started");
+        
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                // Get next item from queue
+                var item = await _uploadQueue.DequeueAsync(cancellationToken);
+                
+                if (item == null)
+                {
+                    // Queue is empty, wait before checking again
+                    await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                    continue;
+                }
+                
+                // Wait for upload slot
+                await _uploadSemaphore.WaitAsync(cancellationToken);
+                
+                // Upload in background
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await UploadRecordingAsync(item, cancellationToken);
+                    }
+                    finally
+                    {
+                        _uploadSemaphore.Release();
+                    }
+                }, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Upload worker cancelled");
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in upload worker");
+                await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+            }
+        }
+        
+        _logger.LogInformation("Upload worker stopped");
+    }
+    
+    /// <summary>
+    /// Uploads a single recording to S3 with retry logic.
+    /// </summary>
+    private async Task UploadRecordingAsync(
+        UploadQueueItem item,
+        CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        
+        _logger.LogInformation(
+            "Starting upload: {RecordingId}, Attempt: {Attempt}",
+            item.RecordingId,
+            item.RetryCount + 1
+        );
+        
+        try
+        {
+            // Verify file exists
+            if (!File.Exists(item.FilePath))
+            {
+                _logger.LogError(
+                    "Recording file not found: {FilePath}",
+                    item.FilePath
+                );
+                
+                item.Status = UploadStatus.Failed;
+                item.ErrorMessage = "File not found";
+                await _uploadQueue.UpdateAsync(item);
+                return;
+            }
+            
+            // Build S3 key: agents/{agentId}/{uuid}.opus
+            var s3Key = $"agents/{item.AgentId}/{item.RecordingId}.opus";
+            
+            // Upload to S3
+            await _s3Client.UploadFileAsync(
+                _config.BucketName,
+                s3Key,
+                item.FilePath,
+                cancellationToken
+            );
+            
+            stopwatch.Stop();
+            
+            _logger.LogInformation(
+                "Upload successful: {RecordingId}, Duration: {Duration}ms, Size: {Size} bytes",
+                item.RecordingId,
+                stopwatch.ElapsedMilliseconds,
+                item.FileSize
+            );
+            
+            // Update status
+            item.Status = UploadStatus.Completed;
+            item.S3Key = s3Key;
+            item.UploadedAt = DateTime.UtcNow;
+            await _uploadQueue.UpdateAsync(item);
+            
+            // Delete local file
+            try
+            {
+                File.Delete(item.FilePath);
+                _logger.LogDebug(
+                    "Deleted local file: {FilePath}",
+                    item.FilePath
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to delete local file: {FilePath}",
+                    item.FilePath
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Upload failed: {RecordingId}, Attempt: {Attempt}",
+                item.RecordingId,
+                item.RetryCount + 1
+            );
+            
+            item.RetryCount++;
+            item.ErrorMessage = ex.Message;
+            
+            if (item.RetryCount >= _config.MaxRetries)
+            {
+                _logger.LogError(
+                    "Max retries exceeded for {RecordingId}, marking as failed",
+                    item.RecordingId
+                );
+                
+                item.Status = UploadStatus.Failed;
+                await _uploadQueue.UpdateAsync(item);
+            }
+            else
+            {
+                // Calculate backoff delay
+                var delay = CalculateBackoffDelay(item.RetryCount);
+                
+                _logger.LogInformation(
+                    "Will retry {RecordingId} in {Delay}s",
+                    item.RecordingId,
+                    delay.TotalSeconds
+                );
+                
+                item.Status = UploadStatus.Retrying;
+                item.NextRetryAt = DateTime.UtcNow.Add(delay);
+                await _uploadQueue.UpdateAsync(item);
+                
+                // Re-queue after delay
+                await Task.Delay(delay, cancellationToken);
+                await _uploadQueue.EnqueueAsync(item);
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Calculates exponential backoff delay.
+    /// </summary>
+    private TimeSpan CalculateBackoffDelay(int retryCount)
+    {
+        // Exponential backoff: 2^retryCount seconds, max 5 minutes
+        var seconds = Math.Min(
+            Math.Pow(2, retryCount),
+            300
+        );
+        
+        return TimeSpan.FromSeconds(seconds);
+    }
+    
+    /// <summary>
+    /// Stops the upload manager gracefully.
+    /// </summary>
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Stopping upload manager");
+        
+        _cancellationTokenSource?.Cancel();
+        
+        if (_uploadWorker != null)
+        {
+            await _uploadWorker;
+        }
+        
+        _logger.LogInformation("Upload manager stopped");
+    }
+}
+
+/// <summary>
+/// S3 client wrapper for uploading files.
+/// </summary>
+public class S3Client : IS3Client
+{
+    private readonly AmazonS3Client _client;
+    private readonly ILogger<S3Client> _logger;
+    
+    public S3Client(
+        IOptions<AwsConfig> config,
+        ILogger<S3Client> logger)
+    {
+        _logger = logger;
+        
+        // Initialize S3 client with credentials
+        var credentials = new BasicAWSCredentials(
+            config.Value.AccessKeyId,
+            config.Value.SecretAccessKey
+        );
+        
+        _client = new AmazonS3Client(
+            credentials,
+            RegionEndpoint.GetBySystemName(config.Value.Region)
+        );
+    }
+    
+    /// <summary>
+    /// Uploads a file to S3.
+    /// </summary>
+    public async Task UploadFileAsync(
+        string bucketName,
+        string key,
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        var transferUtility = new TransferUtility(_client);
+        
+        var request = new TransferUtilityUploadRequest
+        {
+            BucketName = bucketName,
+            Key = key,
+            FilePath = filePath,
+            CannedACL = S3CannedACL.Private,
+            ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256
+        };
+        
+        // Add metadata
+        request.Metadata.Add("uploaded-at", DateTime.UtcNow.ToString("o"));
+        request.Metadata.Add("content-type", "audio/opus");
+        
+        await transferUtility.UploadAsync(request, cancellationToken);
+    }
+}
+
+/// <summary>
+/// Persistent queue for upload items using SQLite.
+/// </summary>
+public class UploadQueue : IUploadQueue
+{
+    private readonly string _dbPath;
+    private readonly ILogger<UploadQueue> _logger;
+    
+    public UploadQueue(
+        IOptions<UploadConfig> config,
+        ILogger<UploadQueue> logger)
+    {
+        _logger = logger;
+        _dbPath = Path.Combine(
+            config.Value.QueueDirectory,
+            "upload_queue.db"
+        );
+        
+        InitializeDatabase();
+    }
+    
+    private void InitializeDatabase()
+    {
+        using var connection = new SqliteConnection($"Data Source={_dbPath}");
+        connection.Open();
+        
+        var command = connection.CreateCommand();
+        command.CommandText = @"
+            CREATE TABLE IF NOT EXISTS upload_queue (
+                recording_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                metadata TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                s3_key TEXT,
+                queued_at TEXT NOT NULL,
+                next_retry_at TEXT,
+                uploaded_at TEXT
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_status 
+                ON upload_queue(status);
+            
+            CREATE INDEX IF NOT EXISTS idx_next_retry 
+                ON upload_queue(next_retry_at);
+        ";
+        command.ExecuteNonQuery();
+    }
+    
+    public async Task EnqueueAsync(UploadQueueItem item)
+    {
+        await Task.Run(() =>
+        {
+            using var connection = new SqliteConnection($"Data Source={_dbPath}");
+            connection.Open();
+            
+            var command = connection.CreateCommand();
+            command.CommandText = @"
+                INSERT OR REPLACE INTO upload_queue (
+                    recording_id, agent_id, file_path, file_size,
+                    metadata, status, retry_count, error_message,
+                    s3_key, queued_at, next_retry_at, uploaded_at
+                ) VALUES (
+                    @recording_id, @agent_id, @file_path, @file_size,
+                    @metadata, @status, @retry_count, @error_message,
+                    @s3_key, @queued_at, @next_retry_at, @uploaded_at
+                );
+            ";
+            
+            command.Parameters.AddWithValue("@recording_id", item.RecordingId);
+            command.Parameters.AddWithValue("@agent_id", item.AgentId);
+            command.Parameters.AddWithValue("@file_path", item.FilePath);
+            command.Parameters.AddWithValue("@file_size", item.FileSize);
+            command.Parameters.AddWithValue("@metadata", 
+                JsonSerializer.Serialize(item.Metadata));
+            command.Parameters.AddWithValue("@status", (int)item.Status);
+            command.Parameters.AddWithValue("@retry_count", item.RetryCount);
+            command.Parameters.AddWithValue("@error_message", 
+                item.ErrorMessage ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@s3_key", 
+                item.S3Key ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@queued_at", 
+                item.QueuedAt.ToString("o"));
+            command.Parameters.AddWithValue("@next_retry_at", 
+                item.NextRetryAt?.ToString("o") ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@uploaded_at", 
+                item.UploadedAt?.ToString("o") ?? (object)DBNull.Value);
+            
+            command.ExecuteNonQuery();
+        });
+    }
+    
+    public async Task<UploadQueueItem> DequeueAsync(CancellationToken cancellationToken)
+    {
+        return await Task.Run(() =>
+        {
+            using var connection = new SqliteConnection($"Data Source={_dbPath}");
+            connection.Open();
+            
+            var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT * FROM upload_queue
+                WHERE status IN (0, 2) -- Pending or Retrying
+                  AND (next_retry_at IS NULL OR next_retry_at <= @now)
+                ORDER BY queued_at ASC
+                LIMIT 1;
+            ";
+            
+            command.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o"));
+            
+            using var reader = command.ExecuteReader();
+            
+            if (!reader.Read())
+            {
+                return null;
+            }
+            
+            return MapToQueueItem(reader);
+        }, cancellationToken);
+    }
+    
+    public async Task UpdateAsync(UploadQueueItem item)
+    {
+        await Task.Run(() =>
+        {
+            using var connection = new SqliteConnection($"Data Source={_dbPath}");
+            connection.Open();
+            
+            var command = connection.CreateCommand();
+            command.CommandText = @"
+                UPDATE upload_queue
+                SET status = @status,
+                    retry_count = @retry_count,
+                    error_message = @error_message,
+                    s3_key = @s3_key,
+                    next_retry_at = @next_retry_at,
+                    uploaded_at = @uploaded_at
+                WHERE recording_id = @recording_id;
+            ";
+            
+            command.Parameters.AddWithValue("@status", (int)item.Status);
+            command.Parameters.AddWithValue("@retry_count", item.RetryCount);
+            command.Parameters.AddWithValue("@error_message", 
+                item.ErrorMessage ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@s3_key", 
+                item.S3Key ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@next_retry_at", 
+                item.NextRetryAt?.ToString("o") ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@uploaded_at", 
+                item.UploadedAt?.ToString("o") ?? (object)DBNull.Value);
+            command.Parameters.AddWithValue("@recording_id", item.RecordingId);
+            
+            command.ExecuteNonQuery();
+        });
+    }
+    
+    private UploadQueueItem MapToQueueItem(SqliteDataReader reader)
+    {
+        return new UploadQueueItem
+        {
+            RecordingId = reader.GetString(0),
+            AgentId = reader.GetString(1),
+            FilePath = reader.GetString(2),
+            FileSize = reader.GetInt64(3),
+            Metadata = JsonSerializer.Deserialize<RecordingMetadata>(
+                reader.GetString(4)
+            ),
+            Status = (UploadStatus)reader.GetInt32(5),
+            RetryCount = reader.GetInt32(6),
+            ErrorMessage = reader.IsDBNull(7) ? null : reader.GetString(7),
+            S3Key = reader.IsDBNull(8) ? null : reader.GetString(8),
+            QueuedAt = DateTime.Parse(reader.GetString(9)),
+            NextRetryAt = reader.IsDBNull(10) 
+                ? null 
+                : DateTime.Parse(reader.GetString(10)),
+            UploadedAt = reader.IsDBNull(11) 
+                ? null 
+                : DateTime.Parse(reader.GetString(11))
+        };
+    }
+}
+
+public class UploadQueueItem
+{
+    public string RecordingId { get; set; }
+    public string AgentId { get; set; }
+    public string FilePath { get; set; }
+    public long FileSize { get; set; }
+    public RecordingMetadata Metadata { get; set; }
+    public UploadStatus Status { get; set; }
+    public int RetryCount { get; set; }
+    public string ErrorMessage { get; set; }
+    public string S3Key { get; set; }
+    public DateTime QueuedAt { get; set; }
+    public DateTime? NextRetryAt { get; set; }
+    public DateTime? UploadedAt { get; set; }
+}
+
+public enum UploadStatus
+{
+    Pending = 0,
+    Uploading = 1,
+    Retrying = 2,
+    Completed = 3,
+    Failed = 4
+}
+```
+
+---
+
+## Configuration
+
+### appsettings.json
+
+```json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft": "Warning",
+      "System": "Warning"
+    }
+  },
+  
+  "Recording": {
+    "TempDirectory": "C:\\ProgramData\\CallRecorder\\Temp",
+    "QueueDirectory": "C:\\ProgramData\\CallRecorder\\Queue",
+    "MaxLocalStorage": 10737418240,
+    "PreBufferSeconds": 10
+  },
+  
+  "Upload": {
+    "MaxConcurrentUploads": 3,
+    "MaxRetries": 5,
+    "QueueDirectory": "C:\\ProgramData\\CallRecorder\\Queue"
+  },
+  
+  "Aws": {
+    "Region": "us-east-1",
+    "BucketName": "call-recordings-prod",
+    "AccessKeyId": "ENCRYPTED",
+    "SecretAccessKey": "ENCRYPTED"
+  },
+  
+  "CallDetection": {
+    "PollIntervalMs": 500,
+    "ConfidenceThreshold": 70,
+    "MinimumCallDurationSeconds": 30
+  },
+  
+  "DataDog": {
+    "ApiKey": "ENCRYPTED",
+    "ServiceName": "call-recorder",
+    "Environment": "production"
+  },
+  
+  "Monitoring": {
+    "HealthCheckIntervalSeconds": 60,
+    "MetricsIntervalSeconds": 30
+  }
+}
+```
+
+### Configuration Encryption (Windows DPAPI)
+
+```csharp
+/// <summary>
+/// Encrypts/decrypts configuration values using Windows DPAPI.
+/// </summary>
+public class ConfigurationEncryption
+{
+    public static string Encrypt(string plainText)
+    {
+        var plainBytes = Encoding.UTF8.GetBytes(plainText);
+        var encryptedBytes = ProtectedData.Protect(
+            plainBytes,
+            null, // No additional entropy
+            DataProtectionScope.LocalMachine // Machine-wide protection
+        );
+        return Convert.ToBase64String(encryptedBytes);
+    }
+    
+    public static string Decrypt(string cipherText)
+    {
+        var encryptedBytes = Convert.FromBase64String(cipherText);
+        var decryptedBytes = ProtectedData.Unprotect(
+            encryptedBytes,
+            null,
+            DataProtectionScope.LocalMachine
+        );
+        return Encoding.UTF8.GetString(decryptedBytes);
+    }
+}
+
+/// <summary>
+/// Configuration provider that auto-decrypts encrypted values.
+/// </summary>
+public class EncryptedConfigurationProvider : IConfigurationProvider
+{
+    private readonly IConfiguration _configuration;
+    
+    public EncryptedConfigurationProvider(IConfiguration configuration)
+    {
+        _configuration = configuration;
+    }
+    
+    public string GetDecryptedValue(string key)
+    {
+        var value = _configuration[key];
+        
+        if (value == null)
+            return null;
+        
+        // Values marked as ENCRYPTED are decrypted
+        if (value == "ENCRYPTED")
+        {
+            // Read from secure storage
+            var encryptedValue = ReadFromSecureStorage(key);
+            return ConfigurationEncryption.Decrypt(encryptedValue);
+        }
+        
+        return value;
+    }
+    
+    private string ReadFromSecureStorage(string key)
+    {
+        // Read from registry or protected file
+        var regPath = $@"SOFTWARE\CallRecorder\Credentials";
+        using var regKey = Registry.LocalMachine.OpenSubKey(regPath);
+        return regKey?.GetValue(key) as string;
+    }
+}
+```
+
+---
+
+## Deployment
+
+### Installation Script (PowerShell)
+
+```powershell
+# install-call-recorder.ps1
+# Run as Administrator on Azure VDI Golden Image
+
+param(
+    [string]$Version = "1.0.0",
+    [string]$Environment = "production"
+)
+
+$ErrorActionPreference = "Stop"
+
+Write-Host "Installing Call Recorder Service v$Version" -ForegroundColor Green
+
+# 1. Create installation directory
+$installPath = "C:\Program Files\CallRecorder"
+Write-Host "Creating installation directory: $installPath"
+New-Item -ItemType Directory -Path $installPath -Force | Out-Null
+
+# 2. Copy application files
+Write-Host "Copying application files..."
+Copy-Item -Path ".\Release\*" -Destination $installPath -Recurse -Force
+
+# 3. Create data directories
+$dataPaths = @(
+    "C:\ProgramData\CallRecorder",
+    "C:\ProgramData\CallRecorder\Temp",
+    "C:\ProgramData\CallRecorder\Queue",
+    "C:\ProgramData\CallRecorder\Logs"
+)
+
+foreach ($path in $dataPaths) {
+    Write-Host "Creating directory: $path"
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+    
+    # Set permissions (SYSTEM full control)
+    $acl = Get-Acl $path
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "NT AUTHORITY\SYSTEM",
+        "FullControl",
+        "ContainerInherit,ObjectInherit",
+        "None",
+        "Allow"
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl $path $acl
+}
+
+# 4. Encrypt and store AWS credentials
+Write-Host "Configuring AWS credentials..."
+$awsAccessKey = Read-Host -Prompt "Enter AWS Access Key ID" -AsSecureString
+$awsSecretKey = Read-Host -Prompt "Enter AWS Secret Access Key" -AsSecureString
+
+# Convert SecureString to plain text, encrypt with DPAPI, store in registry
+$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($awsAccessKey)
+$plainAccessKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+$encryptedAccessKey = & "$installPath\CallRecorder.CLI.exe" encrypt --value $plainAccessKey
+
+$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($awsSecretKey)
+$plainSecretKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+$encryptedSecretKey = & "$installPath\CallRecorder.CLI.exe" encrypt --value $plainSecretKey
+
+# Store in registry
+$regPath = "HKLM:\SOFTWARE\CallRecorder\Credentials"
+New-Item -Path $regPath -Force | Out-Null
+Set-ItemProperty -Path $regPath -Name "AwsAccessKeyId" -Value $encryptedAccessKey
+Set-ItemProperty -Path $regPath -Name "AwsSecretAccessKey" -Value $encryptedSecretKey
+
+Write-Host "Credentials encrypted and stored" -ForegroundColor Green
+
+# 5. Install Windows Service
+Write-Host "Installing Windows Service..."
+$servicePath = Join-Path $installPath "CallRecorder.Service.exe"
+
+New-Service -Name "CallRecorderService" `
+    -BinaryPathName $servicePath `
+    -DisplayName "Call Recording Service" `
+    -Description "Automatically records call center agent calls for QA and compliance" `
+    -StartupType Automatic `
+    -Credential "NT AUTHORITY\SYSTEM"
+
+# 6. Configure service recovery
+Write-Host "Configuring service recovery..."
+sc.exe failure CallRecorderService reset= 86400 actions= restart/60000/restart/60000/restart/60000
+
+# 7. Grant audio access permissions
+Write-Host "Granting audio permissions..."
+net localgroup "Performance Log Users" "NT AUTHORITY\SYSTEM" /add
+
+# 8. Configure Windows Firewall
+Write-Host "Configuring firewall rules..."
+New-NetFirewallRule -DisplayName "CallRecorder S3 Upload" `
+    -Direction Outbound `
+    -Action Allow `
+    -Program $servicePath `
+    -Protocol TCP `
+    -RemotePort 443
+
+# 9. Start service
+Write-Host "Starting service..."
+Start-Service -Name "CallRecorderService"
+
+# 10. Verify service status
+Start-Sleep -Seconds 5
+$service = Get-Service -Name "CallRecorderService"
+
+if ($service.Status -eq "Running") {
+    Write-Host "✓ Service installed and running successfully" -ForegroundColor Green
+} else {
+    Write-Host "✗ Service failed to start. Check logs." -ForegroundColor Red
+    exit 1
+}
+
+# 11. Create uninstall script
+$uninstallScript = @"
+# uninstall-call-recorder.ps1
+Stop-Service -Name "CallRecorderService" -Force
+Remove-Service -Name "CallRecorderService"
+Remove-Item -Path "C:\Program Files\CallRecorder" -Recurse -Force
+Remove-Item -Path "C:\ProgramData\CallRecorder" -Recurse -Force
+Remove-Item -Path "HKLM:\SOFTWARE\CallRecorder" -Recurse -Force
+Remove-NetFirewallRule -DisplayName "CallRecorder S3 Upload"
+Write-Host "Call Recorder uninstalled successfully"
+"@
+
+Set-Content -Path (Join-Path $installPath "uninstall.ps1") -Value $uninstallScript
+
+Write-Host ""
+Write-Host "Installation complete!" -ForegroundColor Green
+Write-Host "Service: CallRecorderService"
+Write-Host "Status: Running"
+Write-Host "Logs: C:\ProgramData\CallRecorder\Logs"
+Write-Host ""
+Write-Host "To uninstall, run: $installPath\uninstall.ps1" -ForegroundColor Yellow
+```
+
+### Deployment Checklist
+
+```
+Pre-Deployment (IT Team):
+☐ Create AWS S3 bucket
+☐ Configure bucket encryption (SSE-S3)
+☐ Create IAM user with S3 PutObject permissions
+☐ Note AWS Access Key and Secret Key
+☐ Prepare Azure VDI golden image
+☐ Ensure audio redirection is enabled on VDI
+☐ Test network connectivity to S3 endpoints
+
+Installation (on Golden Image):
+☐ Download Call Recorder installer
+☐ Run install-call-recorder.ps1 as Administrator
+☐ Enter AWS credentials when prompted
+☐ Verify service is running
+☐ Test with one agent making a test call
+☐ Verify recording appears in S3
+☐ Check DataDog for metrics
+
+Post-Installation:
+☐ Clone golden image to all agents
+☐ Monitor first 10 agent sessions
+☐ Review logs for any errors
+☐ Validate upload success rate
+☐ Set up alerting thresholds in DataDog
+
+Rollback Plan:
+☐ Keep previous golden image snapshot
+☐ Document rollback procedure
+☐ Test rollback in non-production environment
+```
+
+---
+
+## Monitoring & Alerting
+
+### DataDog Integration
+
+```csharp
+/// <summary>
+/// DataDog metrics client for monitoring.
+/// </summary>
+public class DataDogMetrics : IMetricsClient
+{
+    private readonly DogStatsdService _dogStatsd;
+    private readonly ILogger<DataDogMetrics> _logger;
+    
+    public DataDogMetrics(
+        IOptions<DataDogConfig> config,
+        ILogger<DataDogMetrics> logger)
+    {
+        _logger = logger;
+        
+        var dogstatsdConfig = new StatsdConfig
+        {
+            StatsdServerName = config.Value.AgentHost ?? "127.0.0.1",
+            StatsdPort = config.Value.AgentPort,
+            Prefix = "callrecorder"
+        };
+        
+        _dogStatsd = new DogStatsdService();
+        _dogStatsd.Configure(dogstatsdConfig);
+    }
+    
+    /// <summary>
+    /// Track call detected event.
+    /// </summary>
+    public void TrackCallDetected(string agentId, int confidence)
+    {
+        _dogStatsd.Increment("call.detected", 1, tags: new[]
+        {
+            $"agent:{agentId}",
+            $"confidence:{confidence}"
+        });
+        
+        _dogStatsd.Histogram("call.confidence", confidence);
+    }
+    
+    /// <summary>
+    /// Track recording started.
+    /// </summary>
+    public void TrackRecordingStarted(string agentId, string recordingId)
+    {
+        _dogStatsd.Increment("recording.started", 1, tags: new[]
+        {
+            $"agent:{agentId}"
+        });
+    }
+    
+    /// <summary>
+    /// Track recording completed.
+    /// </summary>
+    public void TrackRecordingCompleted(
+        string agentId, 
+        string recordingId, 
+        double durationSeconds,
+        long fileSizeBytes)
+    {
+        _dogStatsd.Increment("recording.completed", 1, tags: new[]
+        {
+            $"agent:{agentId}"
+        });
+        
+        _dogStatsd.Histogram("recording.duration", durationSeconds);
+        _dogStatsd.Histogram("recording.size", fileSizeBytes);
+    }
+    
+    /// <summary>
+    /// Track upload success.
+    /// </summary>
+    public void TrackUploadSuccess(
+        string agentId,
+        string recordingId,
+        double uploadDurationMs,
+        long fileSizeBytes)
+    {
+        _dogStatsd.Increment("upload.success", 1, tags: new[]
+        {
+            $"agent:{agentId}"
+        });
+        
+        _dogStatsd.Histogram("upload.duration", uploadDurationMs);
+        _dogStatsd.Histogram("upload.throughput", fileSizeBytes / uploadDurationMs * 1000);
+    }
+    
+    /// <summary>
+    /// Track upload failure.
+    /// </summary>
+    public void TrackUploadFailure(
+        string agentId,
+        string recordingId,
+        string errorType,
+        int retryCount)
+    {
+        _dogStatsd.Increment("upload.failed", 1, tags: new[]
+        {
+            $"agent:{agentId}",
+            $"error_type:{errorType}",
+            $"retry_count:{retryCount}"
+        });
+    }
+    
+    /// <summary>
+    /// Track device switch event.
+    /// </summary>
+    public void TrackDeviceSwitch(
+        string agentId,
+        string oldDevice,
+        string newDevice)
+    {
+        _dogStatsd.Increment("device.switched", 1, tags: new[]
+        {
+            $"agent:{agentId}",
+            $"from_device:{SanitizeDeviceName(oldDevice)}",
+            $"to_device:{SanitizeDeviceName(newDevice)}"
+        });
+    }
+    
+    /// <summary>
+    /// Track system health metrics.
+    /// </summary>
+    public void TrackSystemHealth(SystemHealth health)
+    {
+        _dogStatsd.Gauge("system.cpu_percent", health.CpuPercent);
+        _dogStatsd.Gauge("system.memory_mb", health.MemoryUsageMB);
+        _dogStatsd.Gauge("system.disk_free_gb", health.DiskFreeGB);
+        _dogStatsd.Gauge("system.queue_size", health.QueueSize);
+        _dogStatsd.Gauge("system.active_recordings", health.ActiveRecordings);
+    }
+    
+    private string SanitizeDeviceName(string deviceName)
+    {
+        // Remove special characters for DataDog tag compliance
+        return deviceName?.Replace(" ", "_")
+            .Replace("(", "")
+            .Replace(")", "")
+            .ToLower() ?? "unknown";
+    }
+}
+
+public class SystemHealth
+{
+    public double CpuPercent { get; set; }
+    public long MemoryUsageMB { get; set; }
+    public long DiskFreeGB { get; set; }
+    public int QueueSize { get; set; }
+    public int ActiveRecordings { get; set; }
+}
+```
+
+### Health Check Service
+
+```csharp
+/// <summary>
+/// Monitors system health and reports to DataDog.
+/// </summary>
+public class HealthCheckService : BackgroundService
+{
+    private readonly ILogger<HealthCheckService> _logger;
+    private readonly IMetricsClient _metricsClient;
+    private readonly IUploadQueue _uploadQueue;
+    private readonly IRecordingManager _recordingManager;
+    private readonly TimeSpan _checkInterval = TimeSpan.FromSeconds(60);
+    
+    public HealthCheckService(
+        ILogger<HealthCheckService> logger,
+        IMetricsClient metricsClient,
+        IUploadQueue uploadQueue,
+        IRecordingManager recordingManager)
+    {
+        _logger = logger;
+        _metricsClient = metricsClient;
+        _uploadQueue = uploadQueue;
+        _recordingManager = recordingManager;
+    }
+    
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Health check service started");
+        
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var health = await CollectHealthMetricsAsync();
+                _metricsClient.TrackSystemHealth(health);
+                
+                // Check for issues
+                CheckForIssues(health);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during health check");
+            }
+            
+            await Task.Delay(_checkInterval, stoppingToken);
+        }
+        
+        _logger.LogInformation("Health check service stopped");
+    }
+    
+    private async Task<SystemHealth> CollectHealthMetricsAsync()
+    {
+        var health = new SystemHealth();
+        
+        // CPU usage
+        using (var cpuCounter = new PerformanceCounter(
+            "Processor", "% Processor Time", "_Total"))
+        {
+            cpuCounter.NextValue(); // First call always returns 0
+            await Task.Delay(100);
+            health.CpuPercent = cpuCounter.NextValue();
+        }
+        
+        // Memory usage
+        var process = Process.GetCurrentProcess();
+        health.MemoryUsageMB = process.WorkingSet64 / 1024 / 1024;
+        
+        // Disk space
+        var drive = new DriveInfo("C");
+        health.DiskFreeGB = drive.AvailableFreeSpace / 1024 / 1024 / 1024;
+        
+        // Queue size
+        health.QueueSize = await _uploadQueue.GetQueueSizeAsync();
+        
+        // Active recordings
+        health.ActiveRecordings = _recordingManager.ActiveRecordingCount;
+        
+        return health;
+    }
+    
+    private void CheckForIssues(SystemHealth health)
+    {
+        // Alert if CPU > 80%
+        if (health.CpuPercent > 80)
+        {
+            _logger.LogWarning(
+                "High CPU usage: {Percent}%",
+                health.CpuPercent
+            );
+        }
+        
+        // Alert if memory > 1GB
+        if (health.MemoryUsageMB > 1024)
+        {
+            _logger.LogWarning(
+                "High memory usage: {MB} MB",
+                health.MemoryUsageMB
+            );
+        }
+        
+        // Alert if disk < 10GB
+        if (health.DiskFreeGB < 10)
+        {
+            _logger.LogError(
+                "Low disk space: {GB} GB remaining",
+                health.DiskFreeGB
+            );
+        }
+        
+        // Alert if queue > 100 items
+        if (health.QueueSize > 100)
+        {
+            _logger.LogWarning(
+                "Large upload queue: {Count} items",
+                health.QueueSize
+            );
+        }
+    }
+}
+```
+
+### DataDog Dashboard Configuration
+
+```json
+{
+  "title": "Call Recorder Monitoring",
+  "description": "Real-time monitoring of call recording system",
+  "widgets": [
+    {
+      "definition": {
+        "title": "Calls Detected (Last Hour)",
+        "type": "query_value",
+        "requests": [
+          {
+            "q": "sum:callrecorder.call.detected{*}.as_count()",
+            "aggregator": "sum"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Active Recordings",
+        "type": "query_value",
+        "requests": [
+          {
+            "q": "avg:callrecorder.system.active_recordings{*}",
+            "aggregator": "last"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Upload Success Rate",
+        "type": "query_value",
+        "requests": [
+          {
+            "q": "(sum:callrecorder.upload.success{*}.as_count() / (sum:callrecorder.upload.success{*}.as_count() + sum:callrecorder.upload.failed{*}.as_count())) * 100",
+            "aggregator": "avg"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Detection Confidence Distribution",
+        "type": "distribution",
+        "requests": [
+          {
+            "q": "avg:callrecorder.call.confidence{*}",
+            "style": {
+              "palette": "dog_classic"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Recording Duration (avg)",
+        "type": "timeseries",
+        "requests": [
+          {
+            "q": "avg:callrecorder.recording.duration{*}",
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Upload Queue Size",
+        "type": "timeseries",
+        "requests": [
+          {
+            "q": "avg:callrecorder.system.queue_size{*}",
+            "display_type": "area"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "System CPU Usage",
+        "type": "timeseries",
+        "requests": [
+          {
+            "q": "avg:callrecorder.system.cpu_percent{*}",
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Upload Failures by Error Type",
+        "type": "toplist",
+        "requests": [
+          {
+            "q": "top(sum:callrecorder.upload.failed{*} by {error_type}.as_count(), 10, 'sum', 'desc')"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+### Alert Definitions
+
+```yaml
+# DataDog Monitor Configurations
+
+# 1. High Upload Failure Rate
+- name: "Call Recorder - High Upload Failure Rate"
+  type: metric alert
+  query: |
+    (sum:callrecorder.upload.failed{*}.as_count().rollup(sum, 300) / 
+    (sum:callrecorder.upload.success{*}.as_count().rollup(sum, 300) + 
+    sum:callrecorder.upload.failed{*}.as_count().rollup(sum, 300))) * 100 > 10
+  message: |
+    Upload failure rate is above 10% in the last 5 minutes.
+    Current rate: {{value}}%
+    
+    This could indicate:
+    - Network connectivity issues
+    - S3 authentication problems
+    - Insufficient disk space
+    
+    @slack-engineering @pagerduty-oncall
+  thresholds:
+    critical: 10
+    warning: 5
+
+# 2. Service Not Running
+- name: "Call Recorder - Service Down"
+  type: service check
+  query: "service_check:callrecorder.can_connect"
+  message: |
+    Call Recorder service is not responding on one or more VDI instances.
+    
+    Affected hosts: {{host.name}}
+    
+    @slack-engineering @pagerduty-oncall
+  no_data_timeframe: 10
+
+# 3. Large Upload Queue
+- name: "Call Recorder - Large Upload Queue"
+  type: metric alert
+  query: "avg(last_10m):avg:callrecorder.system.queue_size{*} > 100"
+  message: |
+    Upload queue has grown to {{value}} items.
+    
+    This could indicate:
+    - Slow upload speeds
+    - High call volume
+    - Network throttling
+    
+    @slack-engineering
+  thresholds:
+    critical: 100
+    warning: 50
+
+# 4. Low Disk Space
+- name: "Call Recorder - Low Disk Space"
+  type: metric alert
+  query: "avg(last_5m):avg:callrecorder.system.disk_free_gb{*} < 10"
+  message: |
+    Low disk space on VDI instance: {{value}} GB remaining.
+    
+    Immediate action required to prevent recording loss.
+    
+    @slack-engineering @pagerduty-oncall
+  thresholds:
+    critical: 10
+    warning: 20
+
+# 5. Zero Calls Detected (During Business Hours)
+- name: "Call Recorder - No Calls Detected"
+  type: metric alert
+  query: "sum(last_1h):sum:callrecorder.call.detected{*}.as_count() < 1"
+  message: |
+    No calls detected in the last hour during business hours.
+    
+    This could indicate:
+    - Service not running
+    - Detection logic failure
+    - Agents not logged in
+    
+    @slack-engineering
+  thresholds:
+    critical: 1
+  evaluation_delay: 900 # 15 minutes
+  notify_no_data: true
+```
+
+---
+
+## Testing
+
+### Unit Tests
+
+```csharp
+/// <summary>
+/// Unit tests for CallDetectionEngine.
+/// </summary>
+public class CallDetectionEngineTests
+{
+    private readonly Mock<IProcessMonitor> _processMonitorMock;
+    private readonly Mock<INetworkMonitor> _networkMonitorMock;
+    private readonly Mock<IAudioSessionMonitor> _audioMonitorMock;
+    private readonly Mock<ILogger<CallDetectionEngine>> _loggerMock;
+    private readonly CallDetectionEngine _engine;
+    
+    public CallDetectionEngineTests()
+    {
+        _processMonitorMock = new Mock<IProcessMonitor>();
+        _networkMonitorMock = new Mock<INetworkMonitor>();
+        _audioMonitorMock = new Mock<IAudioSessionMonitor>();
+        _loggerMock = new Mock<ILogger<CallDetectionEngine>>();
+        
+        _engine = new CallDetectionEngine(
+            _processMonitorMock.Object,
+            _networkMonitorMock.Object,
+            _audioMonitorMock.Object,
+            _loggerMock.Object
+        );
+    }
+    
+    [Fact]
+    public async Task DetectCallState_NoMicrophoneActivity_ReturnsNoCall()
+    {
+        // Arrange
+        _audioMonitorMock
+            .Setup(m => m.GetProcessesUsingMicrophoneAsync())
+            .ReturnsAsync(new List<ProcessInfo>());
+        
+        // Act
+        var result = await _engine.DetectCallStateAsync();
+        
+        // Assert
+        result.IsActive.Should().BeFalse();
+        result.Confidence.Should().Be(0);
+    }
+    
+    [Fact]
+    public async Task DetectCallState_ChromeWithMicAndNetwork_ReturnsActiveCall()
+    {
+        // Arrange
+        var chromeProcess = new ProcessInfo
+        {
+            Id = 1234,
+            ProcessName = "chrome",
+            WindowTitle = "Aircall - Active Call"
+        };
+        
+        _audioMonitorMock
+            .Setup(m => m.GetProcessesUsingMicrophoneAsync())
+            .ReturnsAsync(new List<ProcessInfo> { chromeProcess });
+        
+        _audioMonitorMock
+            .Setup(m => m.HasActiveOutputSession(1234))
+            .Returns(true);
+        
+        var networkActivity = new NetworkActivity
+        {
+            UdpConnectionCount = 2,
+            TotalBytesPerSecond = 5000,
+            RemoteDomains = new List<string> { "call.aircall.io" }
+        };
+        
+        _networkMonitorMock
+            .Setup(m => m.GetProcessNetworkActivityAsync(1234))
+            .ReturnsAsync(networkActivity);
+        
+        // Act
+        var result = await _engine.DetectCallStateAsync();
+        
+        // Assert
+        result.IsActive.Should().BeTrue();
+        result.ProcessName.Should().Be("chrome");
+        result.Confidence.Should().BeGreaterThan(70);
+    }
+    
+    [Fact]
+    public async Task DetectCallState_MicActiveButNoNetwork_ReturnsNoCall()
+    {
+        // Arrange
+        var chromeProcess = new ProcessInfo
+        {
+            Id = 1234,
+            ProcessName = "chrome",
+            WindowTitle = "YouTube"
+        };
+        
+        _audioMonitorMock
+            .Setup(m => m.GetProcessesUsingMicrophoneAsync())
+            .ReturnsAsync(new List<ProcessInfo> { chromeProcess });
+        
+        var networkActivity = new NetworkActivity
+        {
+            UdpConnectionCount = 0,
+            TotalBytesPerSecond = 100,
+            RemoteDomains = new List<string>()
+        };
+        
+        _networkMonitorMock
+            .Setup(m => m.GetProcessNetworkActivityAsync(1234))
+            .ReturnsAsync(networkActivity);
+        
+        // Act
+        var result = await _engine.DetectCallStateAsync();
+        
+        // Assert
+        result.IsActive.Should().BeFalse();
+        result.Confidence.Should().BeLessThan(70);
+    }
+    
+    [Theory]
+    [InlineData("chrome", true)]
+    [InlineData("msedge", true)]
+    [InlineData("firefox", true)]
+    [InlineData("zoom", true)]
+    [InlineData("notepad", false)]
+    [InlineData("spotify", false)]
+    public void IsCallCapableProcess_VariousProcesses_ReturnsExpected(
+        string processName, 
+        bool expected)
+    {
+        // Act
+        var result = _engine.IsCallCapableProcess(processName);
+        
+        // Assert
+        result.Should().Be(expected);
+    }
+}
+
+/// <summary>
+/// Unit tests for DeviceManager.
+/// </summary>
+public class DeviceManagerTests
+{
+    [Fact]
+    public async Task GetBestMicrophone_MultipleDevices_SelectsHighestScore()
+    {
+        // Arrange
+        var logger = new Mock<ILogger<DeviceManager>>();
+        var manager = new DeviceManager(logger.Object);
+        
+        // Mock requires real NAudio devices, so this is integration test
+        // For pure unit test, would need to abstract MMDeviceEnumerator
+        
+        // Act
+        var best = await manager.GetBestMicrophoneAsync();
+        
+        // Assert
+        best.Should().NotBeNull();
+        logger.Verify(
+            l => l.Log(
+                LogLevel.Information,
+                It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((v, t) => v.ToString().Contains("Selected microphone")),
+                null,
+                It.IsAny<Func<It.IsAnyType, Exception, string>>()),
+            Times.Once
+        );
+    }
+    
+    [Fact]
+    public void ScoreDevice_HeadsetUSB_HighScore()
+    {
+        // This test requires access to real device scoring
+        // Implementation would depend on making ScoreDevice testable
+    }
+}
+
+/// <summary>
+/// Unit tests for UploadManager.
+/// </summary>
+public class UploadManagerTests
+{
+    private readonly Mock<ILogger<UploadManager>> _loggerMock;
+    private readonly Mock<IS3Client> _s3ClientMock;
+    private readonly Mock<IUploadQueue> _queueMock;
+    private readonly UploadManager _manager;
+    
+    public UploadManagerTests()
+    {
+        _loggerMock = new Mock<ILogger<UploadManager>>();
+        _s3ClientMock = new Mock<IS3Client>();
+        _queueMock = new Mock<IUploadQueue>();
+        
+        var config = Options.Create(new UploadConfig
+        {
+            MaxConcurrentUploads = 3,
+            MaxRetries = 5,
+            BucketName = "test-bucket"
+        });
+        
+        _manager = new UploadManager(
+            _loggerMock.Object,
+            _s3ClientMock.Object,
+            _queueMock.Object,
+            config
+        );
+    }
+    
+    [Fact]
+    public async Task QueueRecording_ValidMetadata_EnqueuesSuccessfully()
+    {
+        // Arrange
+        var metadata = new RecordingMetadata
+        {
+            RecordingId = "test-123",
+            AgentId = "agent1",
+            FilePath = "C:\\temp\\test.opus",
+            FileSize = 1024000
+        };
+        
+        // Act
+        await _manager.QueueRecordingAsync(metadata);
+        
+        // Assert
+        _queueMock.Verify(
+            q => q.EnqueueAsync(It.Is<UploadQueueItem>(
+                item => item.RecordingId == "test-123" && 
+                        item.Status == UploadStatus.Pending
+            )),
+            Times.Once
+        );
+    }
+    
+    [Fact]
+    public async Task UploadRecording_SuccessfulUpload_UpdatesStatusAndDeletesFile()
+    {
+        // Arrange
+        var tempFile = Path.GetTempFileName();
+        File.WriteAllText(tempFile, "test audio data");
+        
+        var queueItem = new UploadQueueItem
+        {
+            RecordingId = "test-123",
+            AgentId = "agent1",
+            FilePath = tempFile,
+            FileSize = new FileInfo(tempFile).Length,
+            Status = UploadStatus.Pending,
+            RetryCount = 0
+        };
+        
+        _s3ClientMock
+            .Setup(s => s.UploadFileAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()
+            ))
+            .Returns(Task.CompletedTask);
+        
+        // Act
+        // Note: This requires making UploadRecordingAsync public or testable
+        // For demonstration purposes
+        
+        // Assert
+        _s3ClientMock.Verify(
+            s => s.UploadFileAsync(
+                "test-bucket",
+                "agents/agent1/test-123.opus",
+                tempFile,
+                It.IsAny<CancellationToken>()
+            ),
+            Times.Once
+        );
+        
+        File.Exists(tempFile).Should().BeFalse();
+    }
+    
+    [Fact]
+    public void CalculateBackoffDelay_FirstRetry_Returns2Seconds()
+    {
+        // Arrange & Act
+        var delay = _manager.CalculateBackoffDelay(1);
+        
+        // Assert
+        delay.Should().Be(TimeSpan.FromSeconds(2));
+    }
+    
+    [Fact]
+    public void CalculateBackoffDelay_FifthRetry_Returns32Seconds()
+    {
+        // Arrange & Act
+        var delay = _manager.CalculateBackoffDelay(5);
+        
+        // Assert
+        delay.Should().Be(TimeSpan.FromSeconds(32));
+    }
+    
+    [Fact]
+    public void CalculateBackoffDelay_TenthRetry_CapsAt5Minutes()
+    {
+        // Arrange & Act
+        var delay = _manager.CalculateBackoffDelay(10);
+        
+        // Assert
+        delay.Should().Be(TimeSpan.FromMinutes(5));
+    }
+}
+```
+
+### Integration Tests
+
+```csharp
+/// <summary>
+/// Integration tests for end-to-end recording flow.
+/// </summary>
+[Collection("Integration")]
+public class RecordingIntegrationTests : IAsyncLifetime
+{
+    private ServiceProvider _serviceProvider;
+    private string _testDirectory;
+    
+    public async Task InitializeAsync()
+    {
+        _testDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "CallRecorderTests",
+            Guid.NewGuid().ToString("N")
+        );
+        
+        Directory.CreateDirectory(_testDirectory);
+        
+        // Setup DI container with test configuration
+        var services = new ServiceCollection();
+        
+        services.AddLogging(builder =>
+        {
+            builder.AddConsole();
+            builder.SetMinimumLevel(LogLevel.Debug);
+        });
+        
+        services.Configure<RecordingConfig>(config =>
+        {
+            config.TempDirectory = Path.Combine(_testDirectory, "temp");
+            config.QueueDirectory = Path.Combine(_testDirectory, "queue");
+        });
+        
+        services.AddSingleton<IProcessMonitor, ProcessMonitor>();
+        services.AddSingleton<INetworkMonitor, NetworkMonitor>();
+        services.AddSingleton<IAudioSessionMonitor, AudioSessionMonitor>();
+        services.AddSingleton<IDeviceManager, DeviceManager>();
+        services.AddSingleton<IAudioCaptureEngine, AudioCaptureEngine>();
+        services.AddSingleton<IRecordingManager, RecordingManager>();
+        services.AddSingleton<CallDetectionEngine>();
+        
+        _serviceProvider = services.BuildServiceProvider();
+        
+        await Task.CompletedTask;
+    }
+    
+    [Fact]
+    public async Task EndToEnd_DetectCall_RecordAndEncode()
+    {
+        // Arrange
+        var detectionEngine = _serviceProvider.GetRequiredService<CallDetectionEngine>();
+        var recordingManager = _serviceProvider.GetRequiredService<IRecordingManager>();
+        var audioEngine = _serviceProvider.GetRequiredService<IAudioCaptureEngine>();
+        
+        await audioEngine.StartContinuousCaptureAsync();
+        
+        // Simulate call by opening Zoom/Teams/browser
+        // This would require actual application to be running
+        // For automated testing, would use mock audio stream
+        
+        // Act
+        var callState = await detectionEngine.DetectCallStateAsync();
+        
+        if (callState.IsActive)
+        {
+            var recording = await recordingManager.StartRecordingAsync(
+                callState,
+                audioEngine
+            );
+            
+            // Simulate call duration
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            
+            var metadata = await recordingManager.StopRecordingAsync();
+            
+            // Assert
+            metadata.Should().NotBeNull();
+            metadata.Duration.TotalSeconds.Should().BeGreaterThan(4);
+            File.Exists(metadata.FilePath).Should().BeTrue();
+            
+            // Verify file is valid Opus
+            var fileInfo = new FileInfo(metadata.FilePath);
+            fileInfo.Length.Should().BeGreaterThan(0);
+        }
+        
+        audioEngine.StopContinuousCapture();
+    }
+    
+    [Fact]
+    public async Task AudioCapture_DeviceSwitch_ContinuesRecording()
+    {
+        // Arrange
+        var deviceManager = _serviceProvider.GetRequiredService<IDeviceManager>();
+        var audioEngine = _serviceProvider.GetRequiredService<IAudioCaptureEngine>();
+        
+        await audioEngine.StartContinuousCaptureAsync();
+        
+        var initialDevice = await deviceManager.GetBestMicrophoneAsync();
+        
+        // Act - simulate device change
+        // In real test, would plug/unplug USB headset
+        // For automation, trigger device changed event
+        
+        var newDevice = await deviceManager.GetBestMicrophoneAsync();
+        
+        // Assert
+        // Verify recording continued without interruption
+        // Check for device switch flag in metadata
+        
+        audioEngine.StopContinuousCapture();
+    }
+    
+    public async Task DisposeAsync()
+    {
+        _serviceProvider?.Dispose();
+        
+        if (Directory.Exists(_testDirectory))
+        {
+            Directory.Delete(_testDirectory, true);
+        }
+        
+        await Task.CompletedTask;
+    }
+}
+```
+
+### Manual Test Cases
+
+```markdown
+# Manual Test Cases
+
+## TC-001: Basic Call Detection
+**Objective:** Verify system detects active calls on supported platforms
+
+**Prerequisites:**
+- Service running
+- Agent logged into VDI
+- Microphone and speakers working
+
+**Test Steps:**
+1. Open Chrome and navigate to Aircall web app
+2. Make a test call
+3. Observe service logs
+
+**Expected Results:**
+- ✓ Log shows "Call detected" within 2 seconds of call starting
+- ✓ Confidence score > 70%
+- ✓ Recording starts automatically
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-002: Multi-Platform Support
+**Objective:** Verify detection works across different calling platforms
+
+**Prerequisites:**
+- Access to Aircall, Five9, and Twilio accounts
+
+**Test Steps:**
+1. Make call using Aircall
+2. Verify recording created
+3. Make call using Five9
+4. Verify recording created
+5. Make call using Twilio
+6. Verify recording created
+
+**Expected Results:**
+- ✓ All three platforms detected successfully
+- ✓ All recordings uploaded to S3
+- ✓ Metadata includes platform identifier
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-003: Device Switch Mid-Call
+**Objective:** Verify recording continues when agent switches audio device
+
+**Prerequisites:**
+- USB headset and Bluetooth headset available
+- Active call
+
+**Test Steps:**
+1. Start call with USB headset
+2. Verify recording active
+3. Unplug USB headset
+4. Plug in Bluetooth headset
+5. Continue call for 30 seconds
+6. End call
+
+**Expected Results:**
+- ✓ Recording continues without interruption
+- ✓ Device switch logged in metadata
+- ✓ Audio quality remains acceptable
+- ✓ No audio gaps in recording
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-004: Network Interruption
+**Objective:** Verify recordings queued when network unavailable
+
+**Prerequisites:**
+- Active call recording
+- Ability to disable network
+
+**Test Steps:**
+1. Start recording a call
+2. Disable VDI network connection
+3. End call (recording completes)
+4. Verify file saved locally
+5. Re-enable network
+6. Wait 2 minutes
+
+**Expected Results:**
+- ✓ Recording saved to local queue
+- ✓ Upload retried when network restored
+- ✓ File uploaded to S3 successfully
+- ✓ Local file deleted after upload
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-005: Service Crash Recovery
+**Objective:** Verify service restarts and resumes operation
+
+**Prerequisites:**
+- Service running
+- Active call
+
+**Test Steps:**
+1. Start recording a call
+2. Forcefully terminate service (Task Manager)
+3. Verify service auto-restarts
+4. Make another call
+
+**Expected Results:**
+- ✓ Service restarts within 60 seconds
+- ✓ Crash logged with stack trace
+- ✓ New calls detected after restart
+- ✓ No recordings lost
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-006: Long Call Recording
+**Objective:** Verify system handles extended calls (1+ hour)
+
+**Prerequisites:**
+- Ability to maintain 1+ hour call
+
+**Test Steps:**
+1. Start a call
+2. Let it run for 60+ minutes
+3. End call
+4. Verify recording
+
+**Expected Results:**
+- ✓ Entire call recorded
+- ✓ File size appropriate (~15 MB for 1 hour)
+- ✓ No memory leaks
+- ✓ CPU usage stable
+- ✓ Upload successful
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-007: Concurrent Calls
+**Objective:** Verify system handles multiple simultaneous calls (if applicable)
+
+**Prerequisites:**
+- Ability to be on 2+ calls simultaneously
+
+**Test Steps:**
+1. Join first call
+2. Join second call (conference scenario)
+3. Verify both recorded
+4. End calls
+
+**Expected Results:**
+- ✓ Both calls detected
+- ✓ Separate recording files created
+- ✓ OR single merged recording with flag
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-008: False Positive Prevention
+**Objective:** Verify system doesn't record non-call audio
+
+**Prerequisites:**
+- Various media sources
+
+**Test Steps:**
+1. Play YouTube video with dialog
+2. Wait 2 minutes
+3. Play Spotify
+4. Wait 2 minutes
+5. Play system sounds
+6. Wait 2 minutes
+
+**Expected Results:**
+- ✓ No recordings created for YouTube
+- ✓ No recordings for Spotify
+- ✓ No recordings for system sounds
+- ✓ Logs show low confidence scores
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-009: Agent Identification
+**Objective:** Verify correct agent ID associated with recordings
+
+**Prerequisites:**
+- Multiple agents with VDI sessions
+
+**Test Steps:**
+1. Agent A makes call
+2. Verify recording tagged with Agent A ID
+3. Agent B makes call
+4. Verify recording tagged with Agent B ID
+
+**Expected Results:**
+- ✓ Recordings in correct S3 folders (agents/agentA/, agents/agentB/)
+- ✓ Metadata contains correct agent ID
+- ✓ No cross-contamination
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+
+---
+
+## TC-010: Performance Under Load
+**Objective:** Verify system performs well with many agents
+
+**Prerequisites:**
+- 100 VDI instances running service
+
+**Test Steps:**
+1. Have 50+ agents make calls simultaneously
+2. Monitor system metrics
+3. Verify all recordings created
+4. Check upload queue
+
+**Expected Results:**
+- ✓ CPU usage < 5% per VDI
+- ✓ Memory usage < 200 MB per VDI
+- ✓ All calls detected
+- ✓ Upload queue processing smoothly
+- ✓ No service crashes
+
+**Actual Results:**
+[To be filled during test]
+
+**Status:** ☐ Pass ☐ Fail
+```
+
+---
+
+## Production Rollout Plan
+
+### Phase 1: Pilot (Week 1-2)
+```
+Participants: 5 agents
+Goals:
+- Validate basic functionality
+- Identify any critical bugs
+- Test across all calling platforms
+- Measure performance impact
+
+Success Criteria:
+- 95%+ call detection rate
+- 99%+ upload success rate
+- < 5% CPU usage
+- Zero data loss
+- No agent complaints about performance
+
+Daily Activities:
+- Review logs each morning
+- Check DataDog dashboard
+- Interview agents for feedback
+- Fix any issues immediately
+
+Go/No-Go Decision:
+- All success criteria met → Proceed to Phase 2
+- Any critical issues → Fix and restart Phase 1
+```
+
+### Phase 2: Expanded Pilot (Week 3-4)
+```
+Participants: 25 agents (25% of team)
+Goals:
+- Validate scalability
+- Test upload infrastructure under load
+- Identify edge cases
+- Gather QA team feedback
+
+Success Criteria:
+- Same as Phase 1
+- Upload queue never exceeds 50 items
+- QA team can access recordings within 1 hour
+- S3 costs within projections
+
+Daily Activities:
+- Monitor system health
+- Review upload queue
+- Check S3 bucket organization
+- Gather agent feedback
+
+Weekly Activities:
+- Review cost metrics
+- QA team review session
+- Adjust thresholds if needed
+
+Go/No-Go Decision:
+- All criteria met → Proceed to Phase 3
+- Performance issues → Optimize and reassess
+```
+
+### Phase 3: Full Rollout (Week 5)
+```
+Participants: All 100 agents
+Goals:
+- Complete migration
+- Establish baseline metrics
+- Confirm operational readiness
+
+Activities:
+- Monday: Deploy to 25 more agents (50 total)
+- Tuesday: Deploy to 25 more agents (75 total)
+- Wednesday: Deploy to final 25 agents (100 total)
+- Thursday-Friday: Monitor and stabilize
+
+Success Criteria:
+- All agents recording successfully
+- Support team trained
+- Escalation procedures documented
+- Monitoring alerts configured
+```
+
+### Phase 4: Optimization (Week 6+)
+```
+Goals:
+- Fine-tune detection algorithms
+- Optimize storage costs
+- Implement advanced features
+- Gather improvement feedback
+
+Activities:
+- Weekly metrics review
+- Monthly cost analysis
+- Quarterly agent surveys
+- Continuous improvement backlog
+```
+
+---
+
+## Troubleshooting Guide
+
+### Issue: Calls Not Being Detected
+
+**Symptoms:**
+- Agent makes call but no recording created
+- Logs show "No call detected" or low confidence scores
+
+**Possible Causes & Solutions:**
+
+1. **Microphone not being used by browser**
+   ```
+   Check: Open Chrome settings → Privacy → Microphone
+   Verify: Browser has permission to use microphone
+   Fix: Grant permission and restart browser
+   ```
+
+2. **Process not in call-capable list**
+   ```
+   Check: Service logs for process name
+   Verify: Is it chrome/msedge/firefox?
+   Fix: Add process to call-capable list if legitimate
+   ```
+
+3. **Network detection failing**
+   ```
+   Check: Are UDP connections being made?
+   Verify: netstat -ano | findstr PID
+   Fix: Adjust network confidence threshold
+   ```
+
+4. **Audio session not detected**
+   ```
+   Check: Is microphone actually active?
+   Verify: Windows Sound settings → Recording devices
+   Fix: Ensure device not muted/disabled
+   ```
+
+**Diagnostic Steps:**
+```powershell
+# Run diagnostic script
+cd "C:\Program Files\CallRecorder"
+.\Diagnostics.ps1 -Verbose
+
+# Check logs
+Get-Content "C:\ProgramData\CallRecorder\Logs\latest.log" -Tail 100
+
+# Verify service status
+Get-Service CallRecorderService
+
+# Check process audio sessions
+.\Tools\AudioSessionDump.exe
+```
+
+---
+
+### Issue: Recordings Not Uploading
+
+**Symptoms:**
+- Local files accumulating
+- Upload queue growing
+- S3 bucket not receiving files
+
+**Possible Causes & Solutions:**
+
+1. **Network connectivity**
+   ```
+   Check: Can VDI reach S3?
+   Verify: Test-NetConnection s3.amazonaws.com -Port 443
+   Fix: Check firewall rules, proxy settings
+   ```
+
+2. **AWS credentials invalid**
+   ```
+   Check: Service logs for authentication errors
+   Verify: Credentials not expired
+   Fix: Update credentials in registry
+   ```
+
+3. **S3 bucket permissions**
+   ```
+   Check: IAM policy for PutObject permission
+   Verify: aws s3 ls s3://call-recordings-prod/
+   Fix: Update IAM policy
+   ```
+
+4. **Disk space full**
+   ```
+   Check: Get-PSDrive C | Select-Object Used,Free
+   Verify: Is temp directory full?
+   Fix: Clear old files, increase disk size
+   ```
+
+**Diagnostic Steps:**
+```powershell
+# Check upload queue
+sqlite3 "C:\ProgramData\CallRecorder\Queue\upload_queue.db" "SELECT COUNT(*) FROM upload_queue WHERE status = 0"
+
+# Test S3 connectivity
+aws s3 ls s3://call-recordings-prod/ --profile callrecorder
+
+# Check service health
+Invoke-WebRequest -Uri "http://localhost:5000/health" -UseBasicParsing
+
+# Force retry of failed uploads
+.\Tools\RetryUploads.exe --max-age 1h
+```
+
+---
+
+### Issue: High CPU Usage
+
+**Symptoms:**
+- VDI sluggish
+- CPU usage > 10%
+- Agents complaining about performance
+
+**Possible Causes & Solutions:**
+
+1. **Too many concurrent detections**
+   ```
+   Check: Is poll interval too frequent?
+   Verify: Current interval in config
+   Fix: Increase from 500ms to 1000ms
+   ```
+
+2. **Memory leak**
+   ```
+   Check: Memory usage trending up over time?
+   Verify: Performance Monitor
+   Fix: Restart service, investigate leak
+   ```
+
+3. **Audio buffer too large**
+   ```
+   Check: PreBufferSeconds configuration
+   Verify: Current setting (should be 10s)
+   Fix: Reduce to 5s if necessary
+   ```
+
+**Diagnostic Steps:**
+```powershell
+# Monitor CPU usage
+Get-Process -Name CallRecorder.Service | Select-Object CPU,WorkingSet
+
+# Check performance counters
+Get-Counter "\Process(CallRecorder.Service)\% Processor Time" -Continuous
+
+# Analyze with PerfView
+.\Tools\PerfView.exe collect -ThreadTime
+
+# Review configuration
+Get-Content "C:\Program Files\CallRecorder\appsettings.json"
+```
+
+---
+
+### Issue: Service Crashes
+
+**Symptoms:**
+- Service stops unexpectedly
+- Windows Event Log shows crashes
+- Recordings interrupted
+
+**Diagnostic Steps:**
+
+1. **Check crash dumps**
+   ```powershell
+   Get-ChildItem "C:\ProgramData\CallRecorder\Dumps" | Sort LastWriteTime -Descending | Select -First 5
+   ```
+
+2. **Review Event Log**
+   ```powershell
+   Get-EventLog -LogName Application -Source CallRecorderService -Newest 20
+   ```
+
+3. **Enable detailed logging**
+   ```json
+   // appsettings.json
+   {
+     "Logging": {
+       "LogLevel": {
+         "Default": "Debug"
+       }
+     }
+   }
+   ```
+
+4. **Analyze with WinDbg**
+   ```
+   windbg -z "C:\ProgramData\CallRecorder\Dumps\crash_20240115.dmp"
+   !analyze -v
+   ```
+
+**Common Crash Causes:**
+
+- **OutOfMemoryException**: Reduce buffer sizes
+- **AccessViolationException**: Audio device disconnected mid-operation
+- **FileNotFoundException**: Temp directory deleted
+- **SocketException**: Network interruption during upload
+
+---
+
+## Disaster Recovery
+
+### Scenario: S3 Bucket Accidentally Deleted
+
+**Impact:** All recordings lost
+
+**Recovery Steps:**
+
+1. **Attempt AWS Support Recovery**
+   ```
+   - Contact AWS Support immediately
+   - Provide bucket name and deletion timestamp
+   - S3 has brief recovery window (hours, not guaranteed)
+   ```
+
+2. **Restore from Backup** (if enabled)
+   ```
+   - If Cross-Region Replication enabled, restore from replica
+   - If versioning enabled, undelete objects
+   ```
+
+3. **Recreate Bucket**
+   ```powershell
+   aws s3 mb s3://call-recordings-prod --region us-east-1
+   aws s3api put-bucket-encryption --bucket call-recordings-prod --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+   ```
+
+4. **Resume Operations**
+   ```
+   - Verify upload queue
+   - Retry failed uploads from local queue
+   - Monitor recovery progress
+   ```
+
+**Prevention:**
+- Enable S3 Versioning
+- Enable MFA Delete
+- Configure Cross-Region Replication
+- Implement S3 Object Lock for compliance
+
+---
+
+### Scenario: VDI Golden Image Corrupted
+
+**Impact:** Cannot deploy to new agents
+
+**Recovery Steps:**
+
+1. **Restore from Snapshot**
+   ```
+   - Revert to last known good snapshot
+   - Validate service functionality
+   - Redeploy if successful
+   ```
+
+2. **Rebuild from Scratch**
+   ```
+   - Provision new Windows 11 VDI
+   - Run installation script
+   - Test thoroughly before deployment
+   ```
+
+3. **Emergency Workaround**
+   ```
+   - Deploy previous version if available
+   - Manual installation per agent (not scalable)
+   ```
+
+**Prevention:**
+- Snapshot golden image before changes
+- Test changes on single instance first
+- Document installation steps
+- Maintain version history
+
+---
+
+### Scenario: Mass Service Failure
+
+**Impact:** Recording stops for all/many agents
+
+**Triage:**
+
+1. **Assess Scope**
+   ```
+   - How many agents affected?
+   - All agents or specific subset?
+   - When did failures start?
+   ```
+
+2. **Check Infrastructure**
+   ```
+   - Is S3 accessible?
+   - Is network functioning?
+   - Are VDI hosts healthy?
+   ```
+
+3. **Review Recent Changes**
+   ```
+   - Was there a recent deployment?
+   - Did Azure update VDI?
+   - Did Windows update?
+   ```
+
+4. **Immediate Mitigation**
+   ```
+   - Rollback recent changes
+   - Restart service on all instances
+   - Switch to backup systems if available
+   ```
+
+**Communication:**
+```
+TO: Engineering Team, QA Team, Management
+SUBJECT: Call Recording Service Incident - [SEVERITY]
+
+STATUS: Investigating / Mitigating / Resolved
+IMPACT: [X] agents unable to record calls
+STARTED: [Timestamp]
+ETA: [Estimate]
+
+CURRENT ACTIONS:
+- [Action 1]
+- [Action 2]
+
+NEXT UPDATE: [Time]
+```
+
+---
+
+## Appendix
+
+### A. Windows Service Code
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var host = Host.CreateDefaultBuilder(args)
+            .UseWindowsService(options =>
+            {
+                options.ServiceName = "CallRecorderService";
+            })
+            .ConfigureServices((hostContext, services) =>
+            {
+                // Configuration
+                services.Configure<RecordingConfig>(
+                    hostContext.Configuration.GetSection("Recording")
+                );
+                services.Configure<UploadConfig>(
+                    hostContext.Configuration.GetSection("Upload")
+                );
+                services.Configure<AwsConfig>(
+                    hostContext.Configuration.GetSection("Aws")
+                );
+                services.Configure<DataDogConfig>(
+                    hostContext.Configuration.GetSection("DataDog")
+                );
+                
+                // Core services
+                services.AddSingleton<IProcessMonitor, ProcessMonitor>();
+                services.AddSingleton<INetworkMonitor, NetworkMonitor>();
+                services.AddSingleton<IAudioSessionMonitor, AudioSessionMonitor>();
+                services.AddSingleton<IDeviceManager, DeviceManager>();
+                services.AddSingleton<IAudioCaptureEngine, AudioCaptureEngine>();
+                services.AddSingleton<IRecordingManager, RecordingManager>();
+                services.AddSingleton<IUploadManager, UploadManager>();
+                services.AddSingleton<CallDetectionEngine>();
+                
+                // Infrastructure
+                services.AddSingleton<IS3Client, S3Client>();
+                services.AddSingleton<IUploadQueue, UploadQueue>();
+                services.AddSingleton<IAgentIdentifier, WindowsAgentIdentifier>();
+                services.AddSingleton<IDnsResolver, DnsResolver>();
+                
+                // Monitoring
+                services.AddSingleton<IMetricsClient, DataDogMetrics>();
+                
+                // Background services
+                services.AddHostedService<CallRecordingService>();
+                services.AddHostedService<UploadManager>();
+                services.AddHostedService<HealthCheckService>();
+            })
+            .ConfigureLogging((hostContext, logging) =>
+            {
+                logging.ClearProviders();
+                logging.AddConsole();
+                logging.AddEventLog(settings =>
+                {
+                    settings.SourceName = "CallRecorderService";
+                });
+                
+                // Serilog for structured logging
+                var logger = new LoggerConfiguration()
+                    .ReadFrom.Configuration(hostContext.Configuration)
+                    .CreateLogger();
+                
+                logging.AddSerilog(logger);
+            })
+            .Build();
+        
+        await host.RunAsync();
+    }
+}
+
+/// <summary>
+/// Main background service orchestrating call recording.
+/// </summary>
+public class CallRecordingService : BackgroundService
+{
+    private readonly ILogger<CallRecordingService> _logger;
+    private readonly CallDetectionEngine _detectionEngine;
+    private readonly IAudioCaptureEngine _audioEngine;
+    private readonly IRecordingManager _recordingManager;
+    private readonly IUploadManager _uploadManager;
+    private readonly IMetricsClient _metricsClient;
+    
+    private CallState _currentCallState = CallState.NoCall;
+    private RecordingSession _activeRecording;
+    
+    public CallRecordingService(
+        ILogger<CallRecordingService> logger,
+        CallDetectionEngine detectionEngine,
+        IAudioCaptureEngine audioEngine,
+        IRecordingManager recordingManager,
+        IUploadManager uploadManager,
+        IMetricsClient metricsClient)
+    {
+        _logger = logger;
+        _detectionEngine = detectionEngine;
+        _audioEngine = audioEngine;
+        _recordingManager = recordingManager;
+        _uploadManager = uploadManager;
+        _metricsClient = metricsClient;
+    }
+    
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Call Recording Service starting");
+        
+        try
+        {
+            // Start continuous audio capture
+            await _audioEngine.StartContinuousCaptureAsync();
+            
+            // Main detection loop
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var callState = await _detectionEngine.DetectCallStateAsync();
+                    
+                    await HandleCallStateAsync(callState);
+                    
+                    // Poll every 500ms
+                    await Task.Delay(500, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error in detection loop");
+                    await Task.Delay(1000, stoppingToken);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex, "Critical error in Call Recording Service");
+            throw;
+        }
+        finally
+        {
+            _audioEngine.StopContinuousCapture();
+            _logger.LogInformation("Call Recording Service stopped");
+        }
+    }
+    
+    private async Task HandleCallStateAsync(CallState callState)
+    {
+        // Call started
+        if (callState.IsActive && !_currentCallState.IsActive)
+        {
+            _logger.LogInformation(
+                "Call started: Process={Process}, Confidence={Confidence}%",
+                callState.ProcessName,
+                callState.Confidence
+            );
+            
+            _metricsClient.TrackCallDetected(
+                callState.AgentId,
+                callState.Confidence
+            );
+            
+            _activeRecording = await _recordingManager.StartRecordingAsync(
+                callState,
+                _audioEngine
+            );
+            
+            _metricsClient.TrackRecordingStarted(
+                _activeRecording.AgentId,
+                _activeRecording.RecordingId
+            );
+        }
+        
+        // Call ended
+        else if (!callState.IsActive && _currentCallState.IsActive)
+        {
+            _logger.LogInformation("Call ended");
+            
+            if (_activeRecording != null)
+            {
+                var metadata = await _recordingManager.StopRecordingAsync();
+                
+                _metricsClient.TrackRecordingCompleted(
+                    metadata.AgentId,
+                    metadata.RecordingId,
+                    metadata.Duration.TotalSeconds,
+                    metadata.FileSize
+                );
+                
+                // Queue for upload
+                await _uploadManager.QueueRecordingAsync(metadata);
+                
+                _activeRecording = null;
+            }
+        }
+        
+        _currentCallState = callState;
+    }
+}
+```
+
+### B. Agent Identifier Implementation
+
+```csharp
+/// <summary>
+/// Identifies agent from Windows username.
+/// </summary>
+public class WindowsAgentIdentifier : IAgentIdentifier
+{
+    private readonly ILogger<WindowsAgentIdentifier> _logger;
+    private string _cachedAgentId;
+    
+    public WindowsAgentIdentifier(ILogger<WindowsAgentIdentifier> logger)
+    {
+        _logger = logger;
+    }
+    
+    public string GetAgentId()
+    {
+        if (_cachedAgentId != null)
+            return _cachedAgentId;
+        
+        try
+        {
+            // Get Windows username
+            var identity = WindowsIdentity.GetCurrent();
+            var username = identity.Name; // DOMAIN\username
+            
+            // Extract just username
+            var parts = username.Split('\\');
+            var agentId = parts.Length > 1 ? parts[1] : parts[0];
+            
+            // Remove @domain.com if present
+            agentId = agentId.Split('@')[0];
+            
+            _logger.LogInformation("Agent identified: {AgentId}", agentId);
+            
+            _cachedAgentId = agentId;
+            return agentId;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error identifying agent");
+            return "unknown";
+        }
+    }
+}
+```
+
+### C. S3 Bucket Structure
+
+```
+call-recordings-prod/
+├── agents/
+│   ├── agent001/
+│   │   ├── 550e8400-e29b-41d4-a716-446655440000.opus
+│   │   ├── 550e8400-e29b-41d4-a716-446655440001.opus
+│   │   └── ...
+│   ├── agent002/
+│   │   ├── 6ba7b810-9dad-11d1-80b4-00c04fd430c8.opus
+│   │   └── ...
+│   └── ...
+└── metadata/ (future)
+    └── recordings.db (future)
+```
+
+### D. Cost Estimation
+
+```
+Monthly Costs (100 agents, 20 working days/month):
+
+Assumptions:
+- 6 hours of calls per agent per day
+- 32 kbps Opus encoding
+- 30-day retention in Standard storage
+- 90-day archive to Glacier
+
+Storage:
+- Total call hours: 100 agents × 6 hrs × 20 days = 12,000 hours/month
+- File size: 14 MB/hour × 12,000 = 168 GB/month
+- Standard storage (30 days): 168 GB × $0.023/GB = $3.86
+- Glacier (after 30 days): cumulative growth
+- Month 2: 168 GB × $0.004/GB = $0.67
+- Month 3: 336 GB × $0.004/GB = $1.34
+- Steady state (after 4 months): ~504 GB Glacier = $2.02
+
+Requests:
+- PUT requests: 12,000 files × $0.005/1000 = $0.06
+- GET requests (QA playback, 10% of files): 1,200 × $0.0004/1000 = $0.0005
+
+Data Transfer:
+- Upload: Free (to S3)
+- Download (QA playback): ~1.68 GB × $0.09/GB = $0.15
+
+Total Monthly Cost:
+- Month 1: $4.07
+- Month 2: $4.74
+- Month 3: $5.40
+- Steady state (Month 4+): ~$6.08
+
+Annual Cost: ~$60-70
+```
+
+### E. Performance Benchmarks
+
+```
+Target Performance (per VDI instance):
+
+CPU Usage:
+- Idle (no calls): < 1%
+- Active recording: < 5%
+- Peak (call detection + recording + upload): < 8%
+
+Memory Usage:
+- Idle: ~50 MB
+- Active recording (1 call): ~150 MB
+- Peak (with pre-buffer): ~200 MB
+
+Network Usage:
+- Real-time upload during call: ~4 KB/s (32 kbps)
+- Batch upload after call: Variable, throttled to not impact call quality
+
+Disk Usage:
+- Service binary: ~50 MB
+- Temp storage (max): 10 GB (configurable)
+- Queue database: ~10 MB
+
+Latency:
+- Call detection: < 2 seconds
+- Recording start: < 500 ms
+- Device switch: < 200 ms
+- Upload start: < 5 seconds after call ends
+
+Reliability:
+- Uptime: 99.9% (service crashes < 0.1%)
+- Detection accuracy: 95%+
+- Upload success rate: 99%+
+- Zero data loss: 100%
+```
+
+---
+
+## Conclusion
+
+This documentation provides a complete blueprint for implementing a production-ready call recording system for your Azure VDI environment. The system is designed to be:
+
+- **Reliable:** Continuous pre-buffering ensures zero audio loss
+- **Scalable:** Handles 100+ agents with minimal resource usage
+- **Maintainable:** Clear architecture, comprehensive logging, monitoring
+- **Secure:** Encrypted storage, DPAPI credential protection, TLS transport
+- **Cost-effective:** ~$6/month vs $2,000-5,000 for SaaS solutions

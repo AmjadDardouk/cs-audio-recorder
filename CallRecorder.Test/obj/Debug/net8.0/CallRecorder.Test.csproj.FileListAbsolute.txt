@@ -1,0 +1,5 @@
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Test\obj\Debug\net8.0\CallRecorder.Test.csproj.AssemblyReference.cache
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Test\obj\Debug\net8.0\CallRecorder.Test.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Test\obj\Debug\net8.0\CallRecorder.Test.AssemblyInfoInputs.cache
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Test\obj\Debug\net8.0\CallRecorder.Test.AssemblyInfo.cs
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.Test\obj\Debug\net8.0\CallRecorder.Test.csproj.CoreCompileInputs.cache

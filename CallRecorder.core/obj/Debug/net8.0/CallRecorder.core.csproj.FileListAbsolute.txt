@@ -1,0 +1,11 @@
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\bin\Debug\net8.0\CallRecorder.core.deps.json
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\bin\Debug\net8.0\CallRecorder.core.dll
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\bin\Debug\net8.0\CallRecorder.core.pdb
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.AssemblyInfoInputs.cache
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.AssemblyInfo.cs
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.csproj.CoreCompileInputs.cache
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.dll
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\refint\CallRecorder.core.dll
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\CallRecorder.core.pdb
+C:\Users\Amjad Dardouk\source\repos\CallRecorder\CallRecorder.core\obj\Debug\net8.0\ref\CallRecorder.core.dll
