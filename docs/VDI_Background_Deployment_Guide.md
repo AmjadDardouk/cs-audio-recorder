@@ -13,7 +13,7 @@ Repository components referenced
 - Service project: CallRecorder.Service
 - Configuration: CallRecorder.Service/appsettings.json
 
-Why Option B?
+Why in the background?
 - Windows Services run in Session 0 and typically cannot access per‑user audio sessions/devices.
 - A per‑user Scheduled Task runs in the interactive session and can access WASAPI input/loopback as permitted by policy.
 
