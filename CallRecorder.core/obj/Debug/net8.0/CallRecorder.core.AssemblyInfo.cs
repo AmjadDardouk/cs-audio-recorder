@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("CallRecorder.core")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3ec2f4b65b7429be03e2a6c4b54a586d04b6ca4c")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+6ce1c9225d4f2e45135e4e1aa68babf996a9eb68")]
 [assembly: System.Reflection.AssemblyProductAttribute("CallRecorder.core")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CallRecorder.core")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
