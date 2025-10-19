@@ -1,4 +1,4 @@
-# CallRecorder – VDI Background Deployment Guide (Option B)
+# CallRecorder – VDI Background Deployment Guide
 
 Last updated: 2025-10-18
 
